@@ -1,0 +1,761 @@
+esphome:
+  name: binary-clock
+  friendly_name: binary-clock
+  comment: Controls a 5x6 matrix of lights and several sensors that interact with each other
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: arduino
+
+# Enable logging
+#logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_binary_clock
+
+ota:
+  password: !secret otapwd_binary_clock
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Binary-Clock Fallback Hotspot"
+    password: "2rRnyYZArjt5"
+
+captive_portal:
+
+mqtt:
+  broker: !secret mqtt_host
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  client_id: binary-clock
+  id: mqtt_client
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_time
+    size: 50
+
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: font_date
+    size: 15
+
+  - file:
+      type: gfonts
+      family: Arimo
+    id: font_notifications
+    size: 13
+
+globals:
+  # Clock brightness is a number that goes from 0 (do NOT dim) up to 100 (make the led matrix dimmer)
+  # Its value depend on the brightness of the light sensor
+  - id: clock_brightness
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  # Will keep an internal track of the amount of notifications shown, in order to know if we are in "notification mode" or normal mode
+  - id: mqtt_notification_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # MQTT subscription to know whether TV is turned or not. Overrides brightness setting and sets it to maximum dim
+  - id: tv_downstairs_on
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  # Timer after which we should cancel the menu action from an inactive rotary encoder operation
+  - id: menu_timer
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Holds the selected page in short-term memory, in order to navigate through them
+  # I've decided unilaterally that submenu's will inherit their parent's id, so a submenu of option 4 will be 41, 42, 43, etc.
+  # This might become an issue if I have more than 10 categories, at which point I should really start asking myself whether I can simplify the UI...
+  - id: menu_selected_page
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # We have the possibility of disabling the matrix clock entirely. Exposed to HA
+  - id: clock_enabled_flag
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # We can turn the OLED screen off entirely. Exposed to HA
+  - id: oled_screen_enabled_flag
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # Optionally, we can set a timer after which the clock will enable itself automatically. Exposed to HA
+  - id: disable_clock_timer
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # The entity in HA is expressed in hours, while we internally keep track of it in seconds
+  - id: disable_clock_multiplier
+    type: int
+    restore_value: no
+    initial_value: '3600'
+
+  # Whether the PIR sensor has detected movement or not
+  - id: movement_detected
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+# Since we have a menu timer, this interval runs in an eternal loop every second and executes stuff if we are navigating through the menu
+interval:
+  - interval: 1sec
+    then:
+      - lambda: |-
+          if (id(disable_clock_timer) > 0) {
+            if (id(clock_enabled_flag) != false) {
+              id(frontend_clock_enabled).turn_off();
+            }
+
+            id(disable_clock_timer)--;
+            if (id(disable_clock_timer) % id(disable_clock_multiplier) == 0) {
+              ESP_LOGD("interval-timer", "Time left: %d seconds, %d hours", id(disable_clock_timer), ceil(id(disable_clock_timer) / id(disable_clock_multiplier)));
+              auto call = id(frontend_clock_timer_disable).make_call();
+              call.set_value(ceil(id(disable_clock_timer) / id(disable_clock_multiplier)));
+              call.perform();
+
+              if (id(disable_clock_timer) == 0) {
+                id(frontend_clock_enabled).turn_on();
+              }
+            }
+          }
+
+          if (id(menu_timer) != 0) {
+            id(menu_timer)--;
+            ESP_LOGD("interval-timer", "Timer menu is running: %d", id(menu_timer));
+
+            if (id(menu_timer) == 0) {
+              id(menu_selected_page) = 0;
+            }
+          }
+      # TODO I hate the following piece of code. Find out a way to generically solve this mess
+      - display.page.show: !lambda |-
+          if (id(menu_selected_page) == 1) {
+            return id(menu_selected_1);
+          } else if (id(menu_selected_page) == 2 ) {
+            return id(menu_selected_2);
+          } else if (id(menu_selected_page) == 3) {
+            return id(menu_selected_3);
+          } else if (id(menu_selected_page) == 4) {
+            return id(menu_selected_4);
+          } else if (id(menu_selected_page) == 41) {
+            return id(menu_selected_41);
+          } else if (id(menu_selected_page) == 42) {
+            return id(menu_selected_42);
+          } else if (id(menu_selected_page) == 43) {
+            return id(menu_selected_43);
+          }
+
+          return id(time_page);
+
+# Sets the time on the device based on the information coming from HA
+time: 
+  - platform: homeassistant
+    id: local_time
+    # Denotes Amsterdam: https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv 
+    timezone: CET-1CEST,M3.5.0,M10.5.0/3
+
+i2c:
+  sda: 21
+  scl: 22
+
+text_sensor:
+  # Exposes the version of the firmware to HA
+  - platform: version
+    name: version
+
+  # Subscribes to the notifications/public MQTT topic, not exposed
+  - platform: mqtt_subscribe
+    name: "Public notifications"
+    id: broker_notifications
+    internal: True
+    topic: notifications/public
+    on_raw_value:
+      then:
+        - lambda: |-
+            id(mqtt_notification_counter)++;
+        - display.page.show: notification_page
+        - component.update: oled_display
+
+  # Subscribes to the sensors/tv-downstairs MQTT topic, not exposed
+  - platform: mqtt_subscribe
+    name: "TV Downstairs is on"
+    id: tv_downstairs_is_on
+    internal: True
+    topic: sensors/tv-downstairs
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGD("sensor_value", "%s", x);
+            id(tv_downstairs_on) = false;
+            return;
+
+number:
+  # Exposes a timer (in hours) to HA that will disable clock mode
+  platform: template
+  id: frontend_clock_timer_disable
+  name: "Timer clock disable"
+  unit_of_measurement: hours
+  optimistic: true
+  mode: slider
+  max_value: 6
+  min_value: 0
+  step: 1
+  set_action:
+    - lambda: |-
+        id(disable_clock_timer) = x * id(disable_clock_multiplier);
+        if (x == 0 && id(clock_enabled_flag) == false) {
+          id(frontend_clock_enabled).turn_on();
+        }
+
+button:
+  - platform: restart
+    name: "Restart"
+
+
+sensor:
+  # Exposes the uptime in seconds to HA
+  - platform: uptime
+    name: "uptime"
+    update_interval: 30s
+
+  # Exposes wifi signal strength sensor to HA
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 30s
+
+  # Brightness sensor, used to calculate max. clock brightness. Exposed to HA
+  - platform: adc
+    pin: 33
+    name: "Brightness"
+    update_interval: 15s
+    device_class: illuminance
+    unit_of_measurement: v
+    filters:
+      - lambda: |-
+          if (id(tv_downstairs_on) == false) {
+            if (x >= 1.0) {
+              id(clock_brightness) = 90;
+            } else if (x <= 0.7) {
+              id(clock_brightness) = 0;
+            } else {
+              id(clock_brightness) = (1 - x) * 300;
+            }
+            ESP_LOGD("clock_brightness", "Setting clock brightness to %d, multiplier is %.04f", id(clock_brightness), x);
+          }
+          return x;
+
+  # Temperature and humidity sensor. Exposed to HA
+  - platform: dht
+    pin: 17
+    model: AM2302
+    temperature:
+      name: "Temperature"
+      accuracy_decimals: 1
+    humidity:
+      name: "Humidity"
+      accuracy_decimals: 1
+    update_interval: 60s
+
+  # Rotary encoder operations. Exposed to HA
+  - platform: rotary_encoder
+    name: "Rotary Encoder"
+    pin_a: 5
+    pin_b: 16
+    resolution: 1
+    accuracy_decimals: 0
+    on_clockwise:
+      - lambda: |-
+          id(menu_timer) = 10;
+          if (id(menu_selected_page) == 4 || id(menu_selected_page) == 43) {
+            return;
+          }
+          id(menu_selected_page)++;
+          return;
+      - display.page.show: !lambda |-
+          if (id(menu_selected_page) == 1) {
+            return id(menu_selected_1);
+          } else if (id(menu_selected_page) == 2 ) {
+            return id(menu_selected_2);
+          } else if (id(menu_selected_page) == 3) {
+            return id(menu_selected_3);
+          } else if (id(menu_selected_page) == 4) {
+            return id(menu_selected_4);
+          } else if (id(menu_selected_page) == 41) {
+            return id(menu_selected_41);
+          } else if (id(menu_selected_page) == 42) {
+            return id(menu_selected_42);
+          }
+          return id(menu_selected_43);
+      - lambda: |-
+          ESP_LOGD("display-page", "menu selected page: %d", id(menu_selected_page));
+      - component.update: oled_display
+    on_anticlockwise:
+      - lambda: |- 
+          id(menu_timer) = 10;
+          if (id(menu_selected_page) == 1 || id(menu_selected_page) == 41) {
+            return;
+          }
+          
+          if (id(menu_selected_page) == 0) {
+            id(menu_selected_page) = 5;
+          }
+          id(menu_selected_page)--;
+          return;
+      - display.page.show: !lambda |-
+          if (id(menu_selected_page) == 1) {
+            return id(menu_selected_1);
+          } else if (id(menu_selected_page) == 2 ) {
+            return id(menu_selected_2);
+          } else if (id(menu_selected_page) == 3) {
+            return id(menu_selected_3);
+          } else if (id(menu_selected_page) == 4) {
+            return id(menu_selected_4);
+          } else if (id(menu_selected_page) == 41) {
+            return id(menu_selected_41);
+          } else if (id(menu_selected_page) == 42) {
+            return id(menu_selected_42);
+          }
+          return id(menu_selected_43);
+      - component.update: oled_display
+
+switch:
+  # Exposes a switch in HA that enables or disabled clock mode
+  - platform: template
+    name: "Clock display enabled"
+    id: frontend_clock_enabled
+    optimistic: true
+    lambda: |-
+      return id(clock_enabled_flag);
+    turn_on_action:
+      - lambda: |-
+          id(clock_enabled_flag) = true;
+          if (id(movement_detected) == true) {
+            id(led_matrix_light).turn_on().set_brightness(1.0).set_effect("Easy Binary clock").perform();
+          }
+      - number.to_min:
+          id: frontend_clock_timer_disable
+    turn_off_action:
+      - lambda: |-
+          id(clock_enabled_flag) = false;
+      - light.turn_off: led_matrix_light
+
+  - platform: template
+    name: "OLED screen enabled"
+    id: oled_screen_enabled
+    optimistic: true
+    lambda: |-
+      return id(oled_screen_enabled_flag);
+    turn_on_action:
+      - lambda: |-
+          id(oled_screen_enabled_flag) = true;
+    turn_off_action:
+      - lambda: |-
+          id(oled_screen_enabled_flag) = false;
+   
+binary_sensor:
+  # PIR sensor, exposed to HA
+  - platform: gpio
+    pin: 27
+    name: "PIR sensor"
+    device_class: motion
+    id: pir_motion_sensor
+    filters:
+      - delayed_off: 30s
+      - lambda: |-
+          if (id(clock_enabled_flag) == true) {
+            if (x) {
+              id(movement_detected) = true;
+              // TODO Resume with the effect we ended the last time
+              id(led_matrix_light).turn_on().set_brightness(1.0).set_effect("Easy Binary clock").perform();
+            } else {
+              id(movement_detected) = false;
+              id(led_matrix_light).turn_off().perform();
+            }
+          }
+          return x;
+
+  # The rotary encoder also has a button. Exposed to HA (not really necessary I think?)
+  - platform: gpio
+    pin: 13
+    id: rotary_button_press
+    name: "Rotary Button Press"
+    filters:
+      - invert
+    on_press:
+      then:
+        - lambda: |-
+            if (id(menu_selected_page) == 1) {
+              id(frontend_clock_enabled).turn_on();
+              id(led_matrix_light).
+                turn_on().
+                set_brightness(1.0).
+                set_effect("Easy Binary clock").
+                perform();
+            } else if (id(menu_selected_page) == 2) {
+              id(frontend_clock_enabled).turn_on();
+              id(led_matrix_light).
+                turn_on().
+                set_brightness(1.0).
+                set_effect("Difficult Binary clock").
+                perform();
+            } else if (id(menu_selected_page) == 3) {
+              id(frontend_clock_enabled).turn_on();
+              id(led_matrix_light).
+                turn_on().
+                set_brightness(1.0).
+                set_effect("Time percentage").
+                perform();
+            } else if (id(menu_selected_page) == 4) {
+              id(menu_selected_page) = 41;
+            } else if (id(menu_selected_page) == 41) {
+              id(menu_selected_page) = 4;
+            } else if (id(menu_selected_page) == 42) {
+              id(frontend_clock_timer_disable).
+                make_call().
+                set_value(1).
+                perform();
+            } else if (id(menu_selected_page) == 43) {
+              id(frontend_clock_timer_disable).
+                make_call().
+                set_value(3).
+                perform();
+            }
+            return;
+        - display.page.show: !lambda |-
+            ESP_LOGD("button-press", "Showing page for menu %d", id(menu_selected_page));
+            if (id(menu_selected_page) == 4) {
+              return id(menu_selected_4);
+            } else if (id(menu_selected_page) == 41) {
+              return id(menu_selected_41);
+            }
+            return id(time_page);
+        - component.update: oled_display
+
+light:
+  # The actual LED strip as an entity
+  - platform: fastled_clockless
+    chipset: WS2812B
+    pin: 18
+    num_leds: 30
+    rgb_order: GRB
+    name: "led_matrix"
+    id: led_matrix_light
+    internal: False
+    restore_mode: RESTORE_AND_ON
+    effects:
+      #  We have several "effects" which are actually modes of operation
+      - addressable_lambda:
+          name: "Easy Binary clock"
+          update_interval: 100ms
+          lambda: |-
+            auto time = id(local_time).now();
+            if (!time.is_valid()) {
+              return;
+            }
+
+            // Always clear screen before a new run
+            it.all() = Color(0, 0, 0);
+
+            Color purple = Color(0xFF00FF);
+            //Color warm_white = Color(0xD5CA97); // Looks great with -100 color
+            Color warm_white = Color(0xD7974F); // Try this one out with the smoke grey screen
+
+            int column = 6;
+            const int TIME_PARTS [column] = {
+              floor(time.hour / 10),   // first_hour_digit
+              (int) time.hour % 10,    // last_hour_digit
+              floor(time.minute / 10), // first_minute_digit
+              (int) time.minute % 10,  // last_minute_digit
+              floor(time.second / 10), // first_second_digit
+              (int) time.second % 10,  // last_second_digit
+            };
+
+            int row = 4;
+            const int POSSIBLE_NUMBERS [row] = { 1, 2, 4, 8 };
+
+            for (column = 5; column >= 0; column--) {
+              // The base color that will illuminate hours and minutes
+              Color chosen_color = warm_white;
+
+              // Seconds have a distinct color (visual aid)
+              if (column >= 4) {
+                // Seconds are always a bit less bright than minutes and hours
+                chosen_color = purple - 25;
+              }
+
+              // Include the measurements of the light sensor to determine LED brightness
+              chosen_color -= id(clock_brightness);
+
+              int tmp = TIME_PARTS[column];
+              for (row = 3; row >= 0; row--) {
+                int current = POSSIBLE_NUMBERS[row];
+                if (tmp >= current && (tmp & current) != 0) {
+                  // Calculates row offset using "row" and adds up the chosen column using "column"
+                  it[(6 * (3 - row)) + column] = chosen_color;
+                  tmp -= current;
+                }
+              }
+            }
+
+      - addressable_lambda:
+          # TODO Dirty code, needs a cleanup
+          name: "Difficult Binary clock"
+          update_interval: 1s
+          lambda: |-
+            auto time = id(local_time).now();
+            if (!time.is_valid()) {
+                return;
+            }
+
+            it.all() = Color(0, 0, 0);
+
+            // Initialize colors always with full brightness
+            Color purple = Color(0xFF00FF);
+            Color white  = Color(0xFFFFFF);
+            //Color warm_white = Color(0xFDF4DC);
+            Color warm_white = Color(0xD5CA97); // Looks great with -100 color
+            Color experiment = Color(0xD7974F);
+
+            int time_parts[3] = {
+                time.hour,
+                time.minute,
+                time.second,
+            };
+
+            for (int i = 2; i >= 0; i--) {
+                Color chosen_color = experiment;
+                int tmp = 0;
+
+                if (i == 2) {
+                    // Seconds are always a bit less bright than minutes and hours
+                    chosen_color = purple - 25;
+                    // Somehow if I use i to retrieve the seconds, it goes totally haywire. If I use a numeric constant, it accepts it?
+                    tmp = time_parts[2];
+                    //ESP_LOGD("difficult", "Tmp: %d ; Index: %d ; Calculated: %d ; i minus 1: %d", tmp, i, time_parts[i], time_parts[i - 1]);
+                } else {
+                    tmp = time_parts[i];
+                }
+
+                chosen_color -= id(clock_brightness);
+
+                //ESP_LOGD("difficult", "Tmp: %d ; Index: %d ; Calculated: %d ; i minus 1: %d", tmp, i, TIME_PARTS[i], TIME_PARTS[i - 1]);
+                if (tmp >= 32 && tmp % 32 < 32) {
+                    it[(i * 12) + 5] = chosen_color;
+                    tmp += 0 - 32;
+                }
+                if (tmp >= 16 && tmp % 16 < 16) {
+                    it[(i * 12) + 4] = chosen_color;
+                    tmp += 0 - 16;
+                }
+                if (tmp >= 8 && tmp % 8 < 8) {
+                    it[(i * 12) + 3] = chosen_color;
+                    tmp += 0 - 8;
+                }
+                if (tmp >= 4 && tmp % 4 < 4) {
+                    it[(i * 12) + 2] = chosen_color;
+                    tmp += 0 - 4;
+                }
+                if (tmp >= 2 && tmp % 2 < 2) {
+                    it[(i * 12) + 1] = chosen_color;
+                    tmp += 0 - 2;
+                }
+                if (tmp >= 1 && tmp % 1 < 1) {
+                    it[(i * 12) + 0] = chosen_color;
+                }
+            }
+
+      - addressable_lambda:
+          # TODO Dirty code, needs a cleanup
+          name: "Time percentage"
+          update_interval: 1s
+          lambda: |-
+            int night_compensation = 50;
+
+            auto time = id(local_time).now();
+            if (!time.is_valid()) {
+                return;
+            }
+
+            it.all() = Color(0, 0, 0);
+
+            // Initialize colors always with full brightness
+            Color purple = Color(0xFF00FF);
+            Color white  = Color(0xFFFFFF);
+            //Color warm_white = Color(0xFDF4DC);
+            Color warm_white = Color(0xD5CA97); // Looks great with -100 color
+            Color experiment = Color(0xD7974F);
+
+            int i = 0;
+
+            int hour_leds = (int) floor(time.hour / 4);
+            int minute_leds = (int) floor(time.minute / 5);
+            int second_leds = (int) floor(time.second / 5);
+
+            int max_brightness = 150;
+
+            //ESP_LOGD("percentage", "Plotting hour %d, minute %d, second %d as %d, %d and %d", time.hour, time.minute, time.second, hour_leds, minute_leds, second_leds);
+
+            for (i = 0; i < hour_leds; i++) {
+                it[i] = experiment - night_compensation;
+            }
+            int rest_hours = time.hour % 4;
+            if (rest_hours > 0) {
+                int percentage = rest_hours * 25;
+                int absolute_brightness = (int) floor(150 - (150 * percentage / 100));
+                it[i] = experiment - night_compensation - absolute_brightness;
+            }
+
+            for (i = 0; i < minute_leds; i++) {
+                it[6 + i] = experiment - night_compensation;
+            }
+            int rest_minutes = time.minute % 5;
+            if (rest_minutes > 0) {
+                int percentage = rest_minutes * 20;
+                int absolute_brightness = (int) floor(150 - (150 * percentage / 100));
+                it[6 + i] = experiment - night_compensation - absolute_brightness;
+            }
+
+            for (i = 0; i < second_leds; i++) {
+                it[18 + i] = purple - night_compensation;
+            }
+            int rest_seconds = time.second % 5;
+            if (rest_seconds > 0) {
+                int percentage = rest_seconds * 20;
+                int absolute_brightness = (int) floor(150 - (150 * percentage / 100));
+                it[18 + i] = purple - night_compensation - absolute_brightness;
+            }
+
+display:
+  # The small OLED screen operation
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    reset_pin: 0
+    address: 0x3C
+    update_interval: 1s
+    id: oled_display
+    pages:
+      # I do use pages for this, since it allows me to keep code simpler. Bit repetitive for menus, but easier to read
+      - id: time_page
+        lambda: |-
+          it.fill(COLOR_OFF);
+          if (id(oled_screen_enabled_flag) == true) {
+            auto time = id(local_time).now();
+
+            it.strftime(0, 0, id(font_time), "%H", time);
+            it.strftime(65, 0, id(font_time), "%M", time);
+            if ((int) time.second % 2 == 1) {
+              it.printf(55, 0, id(font_time), ".");
+            } else {
+              it.printf(55, 0, id(font_time), " ");
+            }
+            it.strftime(32, 50, id(font_date), "%d-%m-%Y", time);
+          }
+      
+      - id: notification_page
+        lambda: |-
+          int NOTIFICATION_TIMER = 8;
+
+          static int notification_seconds_counter = NOTIFICATION_TIMER;
+          static struct {
+            int notification_counter = 0;
+            const char* message = "";
+          } notification;
+
+          if (notification.notification_counter != id(mqtt_notification_counter)) {
+            notification.message = id(broker_notifications).state.c_str();
+            notification.notification_counter = id(mqtt_notification_counter);
+            // We might have gotten a new message while an old one was still displaying, reset counter
+            notification_seconds_counter = NOTIFICATION_TIMER;
+          }
+
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 0, 128, 64);
+
+          it.printf(2, 2, id(font_notifications), "%s", notification.message);
+          it.printf(2, 47, id(font_date), "Hides in %d", notification_seconds_counter);
+          
+          notification_seconds_counter -= 1;
+          if (notification_seconds_counter == 0) {
+            notification_seconds_counter = NOTIFICATION_TIMER;
+            it.show_page(id(time_page));
+          }
+
+      - id: menu_selected_1
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 0, 128, 21);
+          it.printf(2, 2, id(font_date), "Easy binary");
+          it.printf(2, 22, id(font_date), "Complex binary");
+          it.printf(2, 44, id(font_date), "Percentage");
+      
+      - id: menu_selected_2
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 21, 128, 21);
+          it.printf(2, 2, id(font_date), "Easy binary");
+          it.printf(2, 22, id(font_date), "Complex binary");
+          it.printf(2, 44, id(font_date), "Percentage");
+
+      - id: menu_selected_3
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 21, 128, 21);
+          it.printf(2, 2, id(font_date), "Complex binary");
+          it.printf(2, 22, id(font_date), "Percentage");
+          it.printf(2, 44, id(font_date), "Off");
+
+      - id: menu_selected_4
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 43, 128, 21);
+          it.printf(2, 2, id(font_date), "Complex binary");
+          it.printf(2, 22, id(font_date), "Percentage");
+          it.printf(2, 44, id(font_date), "Off");
+
+      - id: menu_selected_41
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 0, 128, 21);
+          it.printf(2, 2, id(font_date), "Previous");
+          it.printf(2, 22, id(font_date), "Hour");
+          it.printf(2, 44, id(font_date), "3 hours");
+          
+      - id: menu_selected_42
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 21, 128, 21);
+          it.printf(2, 2, id(font_date), "Previous");
+          it.printf(2, 22, id(font_date), "Hour");
+          it.printf(2, 44, id(font_date), "3 hours");
+
+      - id: menu_selected_43
+        lambda: |-
+          it.fill(COLOR_OFF);
+          it.rectangle(0, 43, 128, 21);
+          it.printf(2, 2, id(font_date), "Previous");
+          it.printf(2, 22, id(font_date), "Hour");
+          it.printf(2, 44, id(font_date), "3 hours");
+

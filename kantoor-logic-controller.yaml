@@ -1,0 +1,67 @@
+esphome:
+  name: kantoor-logic-controller
+  comment: Gathers different values to ensure I stay healthy by standing up and controls lights around desk
+
+esp32:
+  board: esp32dev
+  variant: esp32
+  framework:
+    type: arduino
+
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk_mode: GPIO0_IN
+  phy_addr: 1
+  power_pin: GPIO16
+
+# Enable logging
+#logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_kantoor_logic_controller
+
+ota:
+  password: !secret otapwd_kantoor_logic_controller
+
+sensor:
+  - platform: ultrasonic
+    trigger_pin: GPIO4
+    echo_pin: GPIO2
+    name: "Ultrasonic Sensor"
+    update_interval: 5s
+
+  - platform: adc
+    pin: GPIO32
+    name: "Office Brightness"
+    update_interval: 31s
+    device_class: illuminance
+    unit_of_measurement: v
+
+binary_sensor:
+  - platform: gpio
+    pin: GPIO15 # Was GPIO39
+    name: "PIR sensor"
+    device_class: motion
+
+light:
+  - platform: monochromatic
+    name: "Ambient lighting office"
+    output: ambient_lighting_office
+
+  - platform: monochromatic
+    name: "Keyboard illumination Camilo"
+    output: keyboard_illumination_camilo
+
+output:
+  - platform: ledc
+    id: ambient_lighting_office
+    pin: GPIO14
+
+  - platform: ledc
+    id: keyboard_illumination_camilo
+    pin: GPIO12
+

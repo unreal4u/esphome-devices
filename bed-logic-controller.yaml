@@ -1,0 +1,59 @@
+esphome:
+  name: bed-logic-controller
+  friendly_name: Bed Logic Controller
+  comment: Handles sensors from under the bed
+
+
+esp32:
+  board: esp32dev
+  variant: esp32
+  framework:
+    type: arduino
+
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk_mode: GPIO0_IN
+  phy_addr: 1
+  power_pin: GPIO16
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "HSdSYtAWMXZTccDVZz7k8ryAS/khlj4MYDWmx0fCefE="
+
+ota:
+  password: "ee35a9a3cebc25123f1efc180ead2f9e"
+
+sensor:
+  - platform: dht
+    pin: GPIO15
+    model: AM2302
+    temperature:
+      name: "Inside box Temperature"
+    humidity:
+      name: "Inside box Humidity"
+    update_interval: 60s
+  - platform: dht
+    pin: GPIO14
+    model: AM2302
+    temperature:
+      name: "Outside box Temperature"
+    humidity:
+      name: "Outside box Humidity"
+    update_interval: 60s
+
+binary_sensor:
+  - platform: gpio
+    pin: GPIO12
+    name: "Camilo PIR sensor"
+    device_class: motion
+  - platform: gpio
+    pin: GPIO4
+    name: "Eva PIR sensor"
+    device_class: motion
+
