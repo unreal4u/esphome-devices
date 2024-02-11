@@ -8,9 +8,6 @@ esp32:
   framework:
     type: arduino
 
-# Enable logging
-#logger:
-
 # Enable Home Assistant API
 api:
   encryption:
@@ -26,6 +23,7 @@ wifi:
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: "Binary-Clock Fallback Hotspot"
+    # Show password here, this is only a fallback and saves me some complexity in case of emergency
     password: "2rRnyYZArjt5"
 
 captive_portal:
@@ -37,6 +35,12 @@ mqtt:
   client_id: binary-clock
   id: mqtt_client
 
+# Uncomment following line to enable logging
+#logger:
+
+##########################################################
+################ Beginning of application ################
+##########################################################
 font:
   - file: "gfonts://Roboto"
     id: font_time
@@ -456,8 +460,9 @@ binary_sensor:
 
 light:
   # The actual LED strip as an entity
-  - platform: fastled_clockless
-    chipset: WS2812B
+  - platform: esp32_rmt_led_strip
+    chipset: ws2812
+    rmt_channel: 0
     pin: 18
     num_leds: 30
     rgb_order: GRB
