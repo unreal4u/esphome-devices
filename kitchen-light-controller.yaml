@@ -164,8 +164,10 @@ light:
           float fan_intensity;
           id(led_roof).remote_values.as_brightness(&brightness);
           ESP_LOGW("light-sensors", "Current brightness is %0.02f", brightness);
+          // Fan should only come on when we are at least 80% brightness
           if (brightness >= 0.8) {
-              fan_intensity = 1-(1-brightness)*3.5;
+              // Linear curve: 80% LED => 30% fan. 90% LED => 65% fan. 100% LED => 100% fan.
+              fan_intensity = 1 - (1 - brightness) * 3.5;
               ESP_LOGW("light-sensors", "Fan intensity would be: %0.03f", fan_intensity);
           }
 
