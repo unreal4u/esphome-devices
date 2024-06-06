@@ -2,6 +2,8 @@ esphome:
   name: kitchen-light-controller
   friendly_name: Kitchen Light Controller
   comment: Controls lights and sensors related to the kitchen rack
+  # All code related to the presence sensor copied directly from the great work from Lewis' team (EPLite): 
+  # https://github.com/EverythingSmartHome/everything-presence-lite
   on_boot: 
     priority: -100
     then:
@@ -57,6 +59,7 @@ i2c:
 
 captive_portal:
 
+# For some reason, dallas had a ton of bugs. Dallasng "just works"
 dallasng:
   - pin: 14
     update_interval: 20s
@@ -70,14 +73,20 @@ globals:
     type: unsigned long
     restore_value: no
     initial_value: '0'
+
+    # Indicates which lights are currently controlled by the rotary encoder button
   - id: currently_controlled_lights
     type: bool
     restore_value: no
     initial_value: 'true' # True == Table, False == Roof
+
+    # Indicates how many time is left on the manual timer override
   - id: timer_manual_control_mode
     type: unsigned int
     restore_value: yes
     initial_value: '0'
+
+    # The default time the manual override lasts
   - id: int_timer_duration
     type: unsigned int
     restore_value: yes
@@ -96,6 +105,7 @@ switch:
     turn_off_action:
       - lambda: |-
           id(timer_manual_control_mode) = 0;
+          id(currently_controlled_lights) = true;
 
 power_supply:
   - id: 'power_supply_led1'
@@ -116,6 +126,7 @@ output:
     id: pwm_led1
     max_power: 0.60
     power_supply: power_supply_led1
+    zero_means_zero: True
 
   - platform: ledc
     pin: 33
@@ -123,18 +134,21 @@ output:
     id: pwm_led2
     max_power: 0.90
     power_supply: power_supply_led2
+    zero_means_zero: True
 
   - platform: ledc
     pin: 26
     frequency: 25000 Hz
     id: pwm_fan1
     min_power: 0
+    zero_means_zero: True
 
   - platform: ledc
     pin: 4
     frequency: 25000 Hz
     id: pwm_fan2
     min_power: 0
+    zero_means_zero: True
 
 light:
   - platform: monochromatic
@@ -163,20 +177,26 @@ light:
           float brightness;
           float fan_intensity;
           id(led_roof).remote_values.as_brightness(&brightness);
-          ESP_LOGW("light-sensors", "Current brightness is %0.02f", brightness);
           // Fan should only come on when we are at least 80% brightness
           if (brightness >= 0.8) {
               // Linear curve: 80% LED => 30% fan. 90% LED => 65% fan. 100% LED => 100% fan.
               fan_intensity = 1 - (1 - brightness) * 3.5;
-              ESP_LOGW("light-sensors", "Fan intensity would be: %0.03f", fan_intensity);
+              id(frontend_fan1_speed).turn_on().set_speed(fan_intensity * 100.0).perform();
+              id(frontend_fan2_speed).turn_on().set_speed(fan_intensity * 100.0).perform();
+          } else {
+              // Stop fans from working
+              id(frontend_fan1_speed).turn_off().perform();
+              id(frontend_fan2_speed).turn_off().perform();
           }
 
 fan:
   - platform: speed
+    id: frontend_fan1_speed
     output: pwm_fan1
     name: "Fan1 speed"
 
   - platform: speed
+    id: frontend_fan2_speed
     output: pwm_fan2
     name: "Fan2 speed"
 
@@ -191,6 +211,7 @@ binary_sensor:
       then:
         - lambda: |-
             id(currently_controlled_lights) = !id(currently_controlled_lights);
+            // TODO Provide a short pulse to know which lights are now actively controlled? But only if already turned on
 
   - platform: template
     name: "Occupancy"
@@ -260,6 +281,11 @@ interval:
                   call.perform();
               }
               id(timer_manual_control_mode)--;
+              // If timer reaches 0, reset mode back to default and timer back to 0 as well
+              if (id(timer_manual_control_mode) == 0) {
+                  id(currently_controlled_lights) = true;
+                  id(frontend_clock_timer_disable).make_call().set_value(0).perform();
+              }
           }
 
 number:
@@ -579,6 +605,7 @@ sensor:
       - lambda: |-
           float brightness;
           id(timer_manual_control_mode) = id(int_timer_duration);
+          // TODO This code could use some optimization... but it works for now
           if (id(currently_controlled_lights) == true) {
               id(led_table).remote_values.as_brightness(&brightness);
               if (brightness < 0.1) {
