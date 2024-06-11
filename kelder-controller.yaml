@@ -1,0 +1,367 @@
+esphome:
+  name: kelder-controller
+  friendly_name: Kelder controller
+  comment: Controls devices in the basement
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_kelder_controller
+
+ota:
+  password: !secret otapwd_kelder_controller
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Kelder-Controller"
+    password: "kDbILql9VepS"
+
+captive_portal:
+
+globals: 
+    # Whether fan is allowed to be turned on (max. 75% of the time in an hour time)
+  - id: timer_fan_operation
+    type: unsigned int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: fan_maximum_on_time
+    type: unsigned int
+    restore_value: yes
+    initial_value: '2700'
+
+  - id: fan_minimum_cooldown_time
+    type: unsigned int
+    restore_value: yes
+    initial_value: '900'
+
+  - id: fan_is_in_forced_cooldown
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+
+
+
+
+
+    # The load resistance on the board. Value in KiloOhms
+  - id: RLOAD
+    type: float
+    restore_value: no
+    initial_value: '1.025'
+
+    #Calibration resistance at atmospheric CO2 level. Outdoor calibration data
+  - id: RZERO
+    type: float
+    restore_value: no
+    initial_value: '35.429'
+
+    # Atmospheric CO2 level for calibration purposes. Outdoor CO2 level during calibration. Usually 450, but it's better to clarify.
+  - id: ATMOCO2
+    type: float
+    restore_value: no
+    initial_value: '450'
+
+#Parameters for calculating ppm of CO2 from sensor resistance
+#  Exponential regression:
+#  GAS      | a      | b
+#  CO       | 605.18 | -3.937  
+#  Alcohol  | 77.255 | -3.18 
+#  CO2      | 110.47 | -2.862
+#  Tolueno  | 44.947 | -3.445
+#  NH4      | 102.2  | -2.473
+#  Acetona  | 34.668 | -3.369
+  - id: PARA
+    type: float
+    restore_value: no
+    initial_value: '110.47'
+  - id: PARB
+    type: float
+    restore_value: no
+    initial_value: '-2.862'
+
+#Parameters to model temperature and humidity dependence
+  - id: CORA
+    type: float
+    restore_value: no
+    initial_value: '0.00035'
+  - id: CORB
+    type: float
+    restore_value: no
+    initial_value: '0.02718'
+  - id: CORC
+    type: float
+    restore_value: no
+    initial_value: '1.39538'
+  - id: CORD
+    type: float
+    restore_value: no
+    initial_value: '0.0018'
+  - id: CORE
+    type: float
+    restore_value: no
+    initial_value: '-0.003333333'
+  - id: CORF
+    type: float
+    restore_value: no
+    initial_value: '-0.001923077'
+  - id: CORG
+    type: float
+    restore_value: no
+    initial_value: '1.130128205'
+
+# Here you need to indicate the supply voltage of the MQ135 sensor. It can be measured with a voltmeter. Please note that the rated power will not always be accurate.
+  - id: volt_resolution
+    type: float
+    restore_value: no
+    initial_value: '4.55'
+
+# 1 for Exponential, 2 for Linear
+  - id: regression_method
+    type: int
+    restore_value: no
+    initial_value: '1'
+
+# Since we have a menu timer, this interval runs in an eternal loop every second and executes stuff if we are navigating through the menu
+interval:
+  - interval: 1sec
+    then:
+      - lambda: |-
+          if (id(device_fan).state) {
+            // Fan is turned on
+            id(timer_fan_operation)++;
+            if (id(timer_fan_operation) >= id(fan_maximum_on_time)) {
+              ESP_LOGD("interval-timer", "Forcing fan OFF due to maximum operation time");
+              auto call = id(device_fan).turn_off();
+              call.perform();
+              id(fan_is_in_forced_cooldown) = true;
+            }
+          } else {
+            // Fan is turned off
+            if (id(timer_fan_operation) > 0) {
+              id(timer_fan_operation)--;
+              if (id(timer_fan_operation) == (id(fan_maximum_on_time) - id(fan_minimum_cooldown_time))) {
+                id(timer_fan_operation) = 0;
+                id(fan_is_in_forced_cooldown) = false;
+              }
+            }
+          }
+
+output:
+  - platform: gpio
+    pin:
+      number: 26
+      inverted: True
+    id: light_relay
+  - platform: gpio
+    pin:
+      number: 27
+      inverted: True
+    id: fan_relay
+
+binary_sensor:
+# Reports when the reed switch from GPIO14 to GND is sensing a magnet and the door is closed.
+- platform: gpio
+  pin:
+    number: GPIO14
+    mode: INPUT_PULLUP
+    inverted: False
+  name: Door opened
+  device_class: door
+  filters:
+    - delayed_on: 100ms
+    - delayed_off: 500ms
+  on_press:
+    then:
+      - light.turn_on: device_light
+  on_release:
+    then:
+      - light.turn_off: device_light
+
+- platform: template
+  name: "Fan cooldown"
+  id: fan_active
+  device_class: lock
+  lambda: |-
+    return !id(fan_is_in_forced_cooldown) == true;
+
+fan:
+  - platform: binary
+    id: device_fan
+    name: "Fan"
+    output: fan_relay
+    on_turn_on:
+      then:
+        - lambda: |-
+            if (id(fan_is_in_forced_cooldown) == true) {
+              ESP_LOGD("fan-relay", "Forcing fan OFF on_turn_on due to minimum time");
+              id(device_fan).turn_off();
+            }
+
+light:
+  - platform: binary
+    id: device_light
+    name: "Lamp"
+    output: light_relay
+
+sensor:
+  - platform: dht
+    model: AM2302
+    pin: 25
+    temperature:
+      id: temperature_reading
+      name: "Temperature"
+    humidity:
+      id: humidity_reading
+      name: "Humidity"
+    update_interval: 30s
+
+  - platform: template
+    name: "Fan timer"
+    unit_of_measurement: seconds
+    update_interval: 1s
+    device_class: duration
+    lambda: |-
+      return id(timer_fan_operation);
+
+  #- platform: template
+  #  name: "Fan cooldown mode"
+  #  update_interval: 5s
+  #  device_class: switch
+  #  lambda: |-
+  #    if (id_fan_is_in_forced_cooldown) == true) {
+  #      return 'yes';
+  #    }
+  #    return 'no';
+
+
+
+
+
+
+
+
+
+
+#  - platform: adc
+#    pin: GPIO32
+#    name: "Gas ADC"
+#    update_interval: 1s
+#    filters:
+#      - multiply: 3.3 # for NodeMcu ESP8266 v3 Lua
+#    accuracy_decimals: 4
+#    unit_of_measurement: V
+#    id: sensor_volt
+
+#  - platform: template
+    #Linearization of the temperature dependency curve under and above 20 degree C
+    #below 20degC: fact = a * t * t - b * t - (h - 33) * d
+    #above 20degC: fact = a * t + b * h + c
+    #this assumes a linear dependency on humidity
+    #getCorrectionFactor
+#    name: "Correction Factor"
+#    lambda: |-
+#      if (id(temperature_reading).state<20) {
+#        return (id(CORA) * id(temperature_reading).state * id(temperature_reading).state - id(CORB) *
+#          id(temperature_reading).state + id(CORC) - (id(humidity_reading).state - 33.) * id(CORD));
+#      } else {
+#        return (id(CORE) * id(temperature_reading).state + id(CORF) * id(humidity_reading).state + id(CORG));
+#      }
+#    update_interval: 10s
+#    accuracy_decimals: 6
+#    id: correction_factor
+
+#  - platform: template
+    #Get the resistance of the sensor, ie. the measurement value @return The sensor resistance in kOhm
+    # RS = [(VC x RL) / VRL] - RL
+    # RS_air = ((5.14*1.0)/sensor_volt)-1.0 Calculate RS in fresh air 
+    #getResistance
+#    name: "Resistance"
+#    lambda: |-
+#      return ((id(volt_resolution)*id(RLOAD)/id(sensor_volt).state) - id(RLOAD));
+#    update_interval: 5s
+#    accuracy_decimals: 3
+#    unit_of_measurement: kOm
+#    id: resistance
+    
+#  - platform: template
+    # Get the resistance of the sensor, ie. the measurement value correctedfor temp/hum @return The corrected sensor resistance kOhm
+    #getCorrectedResistance
+#    name: "Corrected Resistance"
+#    lambda: |-
+#      return (id(resistance).state / id(correction_factor).state);
+#    update_interval: 5s
+#    accuracy_decimals: 3
+#    unit_of_measurement: kOm
+#    id: corrected_resistance
+
+#  - platform: template
+    # Get the ppm of CO2 sensed (assuming only CO2 in the air). The ppm of CO2 in the air
+    #getPPM
+#    name: "PPM CO2"
+#    lambda: |-
+#      if (id(regression_method)==1) {
+#        return (id(PARA) * pow((id(resistance).state / id(RZERO)), id(PARB)));
+#      } else {
+#        return (pow(10, (log10(id(resistance).state / id(RZERO)) - id(PARB)) / id(PARA)));
+#      }
+#    update_interval: 5s
+#    unit_of_measurement: ppm
+#    id: ppm_co2
+
+#  - platform: template
+    # Get the ppm of CO2 sensed (assuming only CO2 in the air), corrected  for temp. The ppm of CO2 in the air
+    #getCorrectedPPM
+#    name: "Corrected PPM CO2"
+#    lambda: |-
+#      if (id(regression_method)==1) {
+#        return (id(PARA) * pow((id(corrected_resistance).state / id(RZERO)), id(PARB)));
+#      } else {
+#        return (pow(10, (log10(id(corrected_resistance).state / id(RZERO)) - id(PARB)) / id(PARA)));
+#      }
+#    update_interval: 5s
+#    unit_of_measurement: ppm
+#    id: corrected_ppm_co2
+
+#  - platform: template
+    # Get the resistance RZero of the sensor for calibration purposes. The sensor resistance RZero in kOhm
+    #getRZero
+#    name: "RZero"
+#    lambda: |-
+#      return (id(resistance).state / pow((id(ATMOCO2) / id(PARA)), (1./id(PARB))));
+#    filters:
+#      - sliding_window_moving_average:
+#          window_size: 15
+#          send_every: 1
+#    update_interval: 5s
+#    accuracy_decimals: 3
+#    unit_of_measurement: kOm
+#    id: r_zero
+
+#  - platform: template
+    # Get the corrected resistance RZero of the sensor for calibration purposes. The corrected sensor resistance RZERO in kOhm for ATMOCO2 level
+    #getCorrectedRZero
+#    name: "CorrectedRZero"
+#    lambda: |-
+#      return (id(corrected_resistance).state / pow((id(ATMOCO2) / id(PARA)), (1./id(PARB))));
+#    filters:
+#      - sliding_window_moving_average:
+#          window_size: 15
+#          send_every: 1
+#    update_interval: 5s
+#    accuracy_decimals: 3
+#    unit_of_measurement: kOm
+#    id: corrected_r_zero
