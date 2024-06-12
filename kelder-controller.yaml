@@ -51,7 +51,16 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
+  
+  - id: current_temperature
+    type: float
+    restore_value: yes
+    initial_value: '0.00'
 
+  - id: current_humidity
+    type: float
+    restore_value: yes
+    initial_value: '0.00'
 
 
 
@@ -224,9 +233,19 @@ sensor:
     temperature:
       id: temperature_reading
       name: "Temperature"
+      on_value:
+        then:
+          lambda: |-
+            ESP_LOGD("dht-sensor", "Temperature changed to %0.02f", x);
+            id(current_temperature) = x;
     humidity:
       id: humidity_reading
       name: "Humidity"
+      on_value:
+        then:
+          lambda: |-
+            ESP_LOGD("dht-sensor", "Humidity changed to %0.02f", x);
+            id(current_humidity) = x;
     update_interval: 30s
 
   - platform: template
@@ -236,6 +255,19 @@ sensor:
     device_class: duration
     lambda: |-
       return id(timer_fan_operation);
+
+  - platform: template
+    name: "Dew point"
+    unit_of_measurement: °C
+    device_class: temperature
+    update_interval: 30s
+    filters:
+      - round: 1 # will round to 1 decimal place
+    lambda: |-
+      // Td = T - ((100 - RH)/5)
+      // Where Td is dew point temperature (in degrees Celsius), T is observed temperature (in degrees Celsius), 
+      // and RH is relative humidity (in percent). Apparently this relationship is fairly accurate for relative humidity values above 50%. 
+      return id(current_temperature) - ((100 - id(current_humidity)) / 5);
 
   #- platform: template
   #  name: "Fan cooldown mode"
@@ -365,3 +397,4 @@ sensor:
 #    accuracy_decimals: 3
 #    unit_of_measurement: kOm
 #    id: corrected_r_zero
+
