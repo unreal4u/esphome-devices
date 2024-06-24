@@ -8,13 +8,17 @@ esp32:
   framework:
     type: arduino
 
+external_components:
+  - source: github://nrandell/dallasng
+
 # Enable Home Assistant API
 api:
   encryption:
     key: !secret apikey_binary_clock
 
 ota:
-  password: !secret otapwd_binary_clock
+  - platform: esphome
+    password: !secret otapwd_binary_clock
 
 wifi:
   ssid: !secret wifi_ssid
@@ -36,7 +40,7 @@ mqtt:
   id: mqtt_client
 
 # Uncomment following line to enable logging
-#logger:
+logger:
 
 ##########################################################
 ################ Beginning of application ################
@@ -184,6 +188,14 @@ time:
 i2c:
   sda: 21
   scl: 22
+  scan: True
+  id: bus_a
+  frequency: 400kHz
+
+# For some reason, dallas had a ton of bugs. Dallasng "just works"
+dallasng:
+  - pin: GPIO26
+    update_interval: 20s
 
 text_sensor:
   # Exposes the version of the firmware to HA
@@ -252,7 +264,7 @@ sensor:
 
   # Brightness sensor, used to calculate max. clock brightness. Exposed to HA
   - platform: adc
-    pin: 33
+    pin: GPIO33
     name: "Brightness"
     update_interval: 15s
     device_class: illuminance
@@ -273,7 +285,7 @@ sensor:
 
   # Temperature and humidity sensor. Exposed to HA
   - platform: dht
-    pin: 17
+    pin: GPIO25
     model: AM2302
     temperature:
       name: "Temperature"
@@ -286,8 +298,8 @@ sensor:
   # Rotary encoder operations. Exposed to HA
   - platform: rotary_encoder
     name: "Rotary Encoder"
-    pin_a: 5
-    pin_b: 16
+    pin_a: GPIO18
+    pin_b: GPIO5
     resolution: 1
     accuracy_decimals: 0
     on_clockwise:
@@ -344,6 +356,13 @@ sensor:
           }
           return id(menu_selected_43);
       - component.update: oled_display
+
+  - platform: dallasng
+    address: 0xff0316a279b93928
+    name: "PCB temperature"
+    resolution: 12
+    filters:
+      - filter_out: NAN
 
 switch:
   # Exposes a switch in HA that enables or disabled clock mode
@@ -463,7 +482,7 @@ light:
   - platform: esp32_rmt_led_strip
     chipset: ws2812
     rmt_channel: 0
-    pin: 18
+    pin: GPIO32
     num_leds: 30
     rgb_order: GRB
     name: "led_matrix"
