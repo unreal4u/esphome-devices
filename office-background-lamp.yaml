@@ -15,7 +15,8 @@ api:
     key: !secret apikey_office_background_lamp
 
 ota:
-  password: !secret otapwd_office_background_lamp
+  - platform: esphome
+    password: !secret otapwd_office_background_lamp
 
 wifi:
   ssid: !secret wifi_ssid
@@ -25,8 +26,6 @@ wifi:
   ap:
     ssid: "Office-Lamp Fallback Hotspot"
     password: "L15oz2Rfb2F9"
-
-captive_portal:
 
 output:
   - platform: gpio

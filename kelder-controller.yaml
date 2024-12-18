@@ -17,7 +17,8 @@ api:
     key: !secret apikey_kelder_controller
 
 ota:
-  password: !secret otapwd_kelder_controller
+  - platform: esphome
+    password: !secret otapwd_kelder_controller
 
 wifi:
   ssid: !secret wifi_ssid
@@ -27,8 +28,6 @@ wifi:
   ap:
     ssid: "Kelder-Controller"
     password: "kDbILql9VepS"
-
-captive_portal:
 
 globals: 
     # Whether fan is allowed to be turned on (max. 75% of the time in an hour time)
@@ -42,10 +41,11 @@ globals:
     restore_value: yes
     initial_value: '2700'
 
+    # Give a tiny bit less than 15 minutes of cooldown time because the cron runs every 1 hour
   - id: fan_minimum_cooldown_time
     type: unsigned int
     restore_value: yes
-    initial_value: '900'
+    initial_value: '890'
 
   - id: fan_is_in_forced_cooldown
     type: bool
@@ -227,6 +227,16 @@ light:
     output: light_relay
 
 sensor:
+  # Exposes the uptime in seconds to HA
+  - platform: uptime
+    name: "uptime"
+    update_interval: 30s
+
+  # Exposes wifi signal strength sensor to HA
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 30s
+
   - platform: dht
     model: AM2302
     pin: 25

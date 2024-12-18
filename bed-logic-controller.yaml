@@ -24,10 +24,11 @@ logger:
 # Enable Home Assistant API
 api:
   encryption:
-    key: "HSdSYtAWMXZTccDVZz7k8ryAS/khlj4MYDWmx0fCefE="
+    key: !secret apikey_bed_logic_controller
 
 ota:
-  password: "ee35a9a3cebc25123f1efc180ead2f9e"
+  - platform: esphome
+    password: !secret otapwd_bed_logic_controller
 
 sensor:
   - platform: dht

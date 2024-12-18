@@ -1,0 +1,172 @@
+substitutions:
+  device_name: kitchen-assistant-esp32-s3
+  device_friendly_name: Kitchen Assistant ESP32-S3
+  device_comment: Controls lights and sensors related to the upper section of the kitchen
+  ld2450_tx_pin: "4"
+  ld2450_rx_pin: "5"
+  dallas_pin: "18"
+  dallas_address: "0x390316a2797da428"
+  dallas_name: "PCB temperature"
+
+packages:
+  basics: !include .basics.yaml
+  ld2450: !include sensors/ld2450.yaml
+  dallas: !include sensors/dallas.yaml
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_kitchen-assistant-esp32-s3
+
+ota:
+  - platform: esphome
+    password: !secret otapwd_kitchen-assistant-esp32-s3
+
+globals:
+  - id: is_night_mode
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+switch:
+  # Exposes a switch in HA that enables or disabled night mode
+  - platform: template
+    name: "Night mode"
+    id: night_mode_enabled
+    optimistic: true
+    lambda: |-
+      return id(is_night_mode);
+    turn_on_action:
+      - lambda: |-
+          id(is_night_mode) = true;
+          // TODO: Turn on the ambient lights at 20%
+          //id(LIGHT_CH4).set_transition_length('2s');
+    turn_off_action:
+      - lambda: |-
+          id(is_night_mode) = false;
+          //id(LIGHT_CH4).set_transition_length('10s');
+
+binary_sensor:
+  # Reports when the switch changes state.
+  - platform: gpio
+    pin:
+      number: 14
+      mode: INPUT_PULLUP
+      inverted: True
+    name: Glass cabinet
+    device_class: door
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 150ms
+    on_press:
+      then:
+        - lambda: |-
+            if (id(is_night_mode)) {
+                id(LIGHT_CH1).turn_on().set_brightness(0.45).perform();
+            } else {
+                id(LIGHT_CH1).turn_on().set_brightness(1.0).perform();
+            }
+    on_release:
+      then:
+        - light.turn_off: LIGHT_CH1
+
+  - platform: gpio
+    pin:
+      number: 13
+      mode: INPUT_PULLUP
+      inverted: False
+    name: Right cabinet door
+    device_class: door
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 250ms
+    on_press:
+      then:
+        - light.turn_on:
+            id: LIGHT_CH2
+            brightness: 25%
+    on_release:
+      then:
+        - light.turn_off: LIGHT_CH2
+
+  - platform: gpio
+    pin:
+      number: 12
+      mode: INPUT_PULLUP
+      inverted: False
+    name: Left cabinet door
+    device_class: door
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 250ms
+    on_press:
+      then:
+        - light.turn_on: LIGHT_CH3
+    on_release:
+      then:
+        - light.turn_off: LIGHT_CH3
+
+  - platform: gpio
+    disabled_by_default: True
+    pin:
+      number: 11
+      mode: INPUT_PULLUP
+      inverted: False
+    name: Door
+    device_class: door
+
+light:
+  - platform: monochromatic
+    id: LIGHT_CH1
+    icon: "mdi:lightbulb-spot"
+    name: "Glass cabinet light"
+    output: LED_CH1
+    default_transition_length: 0.3s
+    flash_transition_length: 2.3s
+
+  - platform: monochromatic
+    id: LIGHT_CH2
+    icon: "mdi:led-strip"
+    name: "Ambient light"
+    output: LED_CH2
+    default_transition_length: 0.3s
+    flash_transition_length: 2.3s
+
+  - platform: monochromatic
+    id: LIGHT_CH3
+    icon: "mdi:led-strip-variant"
+    name: "Left cabinet light"
+    output: LED_CH3
+    default_transition_length: 0.3s
+    flash_transition_length: 2.3s
+
+  - platform: monochromatic
+    id: LIGHT_CH4
+    icon: "mdi:led-strip-variant"
+    name: "Right cabinet light"
+    output: LED_CH4
+    default_transition_length: 10s
+    flash_transition_length: 2.3s
+
+output:
+  - platform: ledc
+    id: LED_CH1
+    pin: 7
+
+  - platform: ledc
+    id: LED_CH2
+    pin: 6
+
+  - platform: ledc
+    id: LED_CH3
+    pin: 1
+
+  - platform: ledc
+    id: LED_CH4
+    pin: 2
+

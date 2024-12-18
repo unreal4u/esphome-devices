@@ -1,0 +1,37 @@
+substitutions:
+  name: wired-bluetooth-proxy
+  friendly_name: Wired Bluetooth Proxy
+
+packages:
+  wt32.bluetooth-proxies: github://esphome/bluetooth-proxies/wt32/wt32-eth01.yaml@main
+
+esphome:
+  name: ${name}
+  name_add_mac_suffix: false
+  friendly_name: ${friendly_name}
+
+api:
+  encryption:
+    key: !secret apikey_m5stack_atom_echo
+
+#esp32_ble_tracker:
+#
+#text_sensor:
+#  - platform: ble_scanner
+#    name: "BLE Devices Scanner"
+
+sensor:
+  # Exposes the uptime in seconds to HA
+  - platform: uptime
+    name: "uptime"
+    update_interval: 30s
+
+button:
+  - platform: restart
+    name: "Restart"
+
+text_sensor:
+  # Exposes the version of the firmware to HA
+  - platform: version
+    name: version
+

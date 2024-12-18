@@ -1,0 +1,86 @@
+substitutions:
+  device_name: plant-care
+  device_friendly_name: Plant care
+  device_comment: Retrieves statistics from the plants in order to inform us if they need watering
+
+packages:
+  basics: !include .basics.yaml
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_plant-care
+
+ota:
+  - platform: esphome
+    password: !secret otapwd_plant-care
+
+globals:
+  - id: ignore_first_readings
+    type: int
+    restore_value: yes
+    initial_value: '40'
+
+switch:
+  - platform: gpio
+    pin: GPIO27
+    inverted: True
+    id: output_relay
+    internal: True
+    on_turn_on: 
+      then:
+        - globals.set: 
+            id: ignore_first_readings
+            value: '40'
+
+sensor:
+  - platform: adc
+    pin: 33
+    icon: "mdi:water"
+    name: "Soil moisture sensor"
+    attenuation: 12db
+    device_class: moisture
+    id: analog_soil_moisture_sensor
+    update_interval: 1sec
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    filters:
+    - calibrate_linear:
+        - 1.3 -> 100
+        - 3.15 -> 0
+    - lambda: |-
+          if (id(output_relay).state) {
+              if (id(ignore_first_readings) != 0) {
+                  id(ignore_first_readings)--;
+                  return {};
+              }
+
+              if (x < 0) return 0; 
+              else if (x > 100) return 100;
+              return x;
+          }
+          return {};
+
+binary_sensor:
+  - platform: gpio
+    pin: 32
+    id: digital_soil_moisture_sensor
+    filters: 
+      - lambda: |-
+          if (id(output_relay).state) {
+            return x;
+          }
+          return {};
+
+interval:
+  - interval: 12h
+    then:
+      - switch.turn_on: output_relay
+      - delay: 50sec
+      - switch.turn_off: output_relay
+
