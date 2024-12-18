@@ -5,32 +5,7 @@ esphome:
 
 logger:
 
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  power_save_mode: NONE
-
-  ap:
-    ssid: "${device_friendly_name}-ap"
-    password: !secret wifi_ap_backup_code
-
-button:
-  - platform: restart
-    name: "Restart"
-
-text_sensor:
-  # Exposes the version of the firmware to HA
-  - platform: version
-    name: version
-
-sensor:
-  # Exposes the uptime in seconds to HA
-  - platform: uptime
-    name: "Uptime"
-    update_interval: 3s
-
-  # Exposes wifi signal strength sensor to HA
-  - platform: wifi_signal
-    name: "WiFi signal"
-    update_interval: 30s
+packages:
+  wifi_network: !include network/wifi.yaml
+  basic_sensors: !include sensors/basics.yaml
 

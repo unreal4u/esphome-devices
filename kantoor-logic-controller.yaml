@@ -8,13 +8,8 @@ esp32:
   framework:
     type: arduino
 
-ethernet:
-  type: LAN8720
-  mdc_pin: GPIO23
-  mdio_pin: GPIO18
-  clk_mode: GPIO0_IN
-  phy_addr: 1
-  power_pin: GPIO16
+packages:
+  networking: !include network/ethernet.yaml
 
 # Enable logging
 #logger:
@@ -25,7 +20,8 @@ api:
     key: !secret apikey_kantoor_logic_controller
 
 ota:
-  password: !secret otapwd_kantoor_logic_controller
+  - platform: esphome
+    password: !secret otapwd_kantoor_logic_controller
 
 sensor:
   - platform: ultrasonic
@@ -41,11 +37,11 @@ sensor:
     device_class: illuminance
     unit_of_measurement: v
 
-binary_sensor:
-  - platform: gpio
-    pin: GPIO15 # Was GPIO39
-    name: "PIR sensor"
-    device_class: motion
+#binary_sensor:
+#  - platform: gpio
+#    pin: GPIO15 # Was GPIO39
+#    name: "PIR sensor"
+#    device_class: motion
 
 light:
   - platform: monochromatic

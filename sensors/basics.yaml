@@ -1,0 +1,20 @@
+button:
+  - platform: restart
+    name: "Restart"
+
+text_sensor:
+  # Exposes the version of the firmware to HA
+  - platform: version
+    name: version
+
+sensor:
+  # Exposes the uptime in seconds to HA
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 3s
+
+  # Exposes wifi signal strength sensor to HA
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 30s
+
