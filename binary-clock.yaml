@@ -1,15 +1,19 @@
-esphome:
-  name: binary-clock
-  friendly_name: binary-clock
-  comment: Controls a 5x6 matrix of lights and several sensors that interact with each other
+substitutions:
+  device_name: binary-clock
+  device_friendly_name: Binary clock
+  device_comment: Controls a 5x6 matrix of lights and several sensors that interact with each other
+  dallas_pin: "GPIO26"
+  dallas_address: "0xff0316a279b93928"
+  dallas_name: "PCB temperature"
+
+packages:
+  basics: !include .basics.yaml
+  dallas: !include sensors/dallas.yaml
 
 esp32:
   board: nodemcu-32s
   framework:
     type: arduino
-
-external_components:
-  - source: github://nrandell/dallasng
 
 # Enable Home Assistant API
 api:
@@ -19,30 +23,6 @@ api:
 ota:
   - platform: esphome
     password: !secret otapwd_binary_clock
-
-wifi:
-  fast_connect: True
-  power_save_mode: none
-  output_power: 8.5
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-  ap:
-    ssid: "Binary-Clock Fallback Hotspot"
-    # Show password here, this is only a fallback and saves me some complexity in case of emergency
-    password: "2rRnyYZArjt5"
-
-#mqtt:
-#  broker: !secret mqtt_host
-#  username: !secret mqtt_user
-#  password: !secret mqtt_password
-#  client_id: binary-clock
-#  id: mqtt_client
-#  keepalive: 5s
-
-# Uncomment following line to enable logging
-logger:
 
 ##########################################################
 ################ Beginning of application ################
@@ -194,42 +174,6 @@ i2c:
   id: bus_a
   frequency: 800kHz
 
-# For some reason, dallas had a ton of bugs. Dallasng "just works"
-dallasng:
-  - pin: GPIO26
-    update_interval: 20s
-
-text_sensor:
-  # Exposes the version of the firmware to HA
-  - platform: version
-    name: version
-
-  # Subscribes to the notifications/public MQTT topic, not exposed
-#  - platform: mqtt_subscribe
-#    name: "Public notifications"
-#    id: broker_notifications
-#    internal: True
-#    topic: notifications/public
-#    on_raw_value:
-#      then:
-#        - lambda: |-
-#            id(mqtt_notification_counter)++;
-#        - display.page.show: notification_page
-#        - component.update: oled_display
-
-  # Subscribes to the sensors/tv-downstairs MQTT topic, not exposed
-#  - platform: mqtt_subscribe
-#    name: "TV Downstairs is on"
-#    id: tv_downstairs_is_on
-#    internal: True
-#    topic: sensors/tv-downstairs
-#    on_value:
-#      then:
-#        - lambda: |-
-#            //ESP_LOGD("sensor_value", "%s", x);
-#            id(tv_downstairs_on) = false;
-#            return;
-
 number:
   # Exposes a timer (in hours) to HA that will disable clock mode
   platform: template
@@ -248,22 +192,7 @@ number:
           id(frontend_clock_enabled).turn_on();
         }
 
-button:
-  - platform: restart
-    name: "Restart"
-
-
 sensor:
-  # Exposes the uptime in seconds to HA
-  - platform: uptime
-    name: "uptime"
-    update_interval: 30s
-
-  # Exposes wifi signal strength sensor to HA
-  - platform: wifi_signal
-    name: "WiFi signal"
-    update_interval: 30s
-
   # Brightness sensor, used to calculate max. clock brightness. Exposed to HA
   - platform: adc
     pin: GPIO33
@@ -358,13 +287,6 @@ sensor:
           }
           return id(menu_selected_43);
       - component.update: oled_display
-
-  - platform: dallasng
-    address: 0xff0316a279b93928
-    name: "PCB temperature"
-    resolution: 12
-    filters:
-      - filter_out: NAN
 
 switch:
   # Exposes a switch in HA that enables or disabled clock mode
