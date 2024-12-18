@@ -1,15 +1,15 @@
-esphome:
-  name: kelder-controller
-  friendly_name: Kelder controller
-  comment: Controls devices in the basement
+substitutions:
+  device_name: kelder-controller
+  device_friendly_name: Kelder controller
+  device_comment: Controls devices in the basement
+
+packages:
+  basics: !include .basics.yaml
 
 esp32:
   board: nodemcu-32s
   framework:
     type: arduino
-
-# Enable logging
-logger:
 
 # Enable Home Assistant API
 api:
@@ -19,15 +19,6 @@ api:
 ota:
   - platform: esphome
     password: !secret otapwd_kelder_controller
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-  ap:
-    ssid: "Kelder-Controller"
-    password: "kDbILql9VepS"
 
 globals: 
     # Whether fan is allowed to be turned on (max. 75% of the time in an hour time)
@@ -227,16 +218,6 @@ light:
     output: light_relay
 
 sensor:
-  # Exposes the uptime in seconds to HA
-  - platform: uptime
-    name: "uptime"
-    update_interval: 30s
-
-  # Exposes wifi signal strength sensor to HA
-  - platform: wifi_signal
-    name: "WiFi signal"
-    update_interval: 30s
-
   - platform: dht
     model: AM2302
     pin: 25
