@@ -3,6 +3,7 @@ substitutions:
   friendly_name: Wired Bluetooth Proxy
 
 packages:
+  # This will automatically import all settings related to the WT32-ETH01 and its network connectivity, so no need to include it manually
   wt32.bluetooth-proxies: github://esphome/bluetooth-proxies/wt32/wt32-eth01.yaml@main
 
 esphome:

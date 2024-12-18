@@ -1,4 +1,4 @@
-# For the ESP32-WT01 devices this is the configuration needed to make the ethernet work
+# For the WT32-ETH01 devices this is the configuration needed to make the ethernet work
 ethernet:
   type: LAN8720
   mdc_pin: GPIO23
