@@ -1,16 +1,11 @@
-external_components:
-  - source: github://nrandell/dallasng
-
-# For some reason, dallas had a ton of bugs. Dallasng "just works"
-dallasng:
-  - pin: ${dallas_pin}
-    update_interval: 20s
+one_wire:
+  - platform: gpio
+    pin: ${dallas_pin}
 
 sensor:
-  - platform: dallasng
+  - platform: dallas_temp
     address: ${dallas_address}
     name: ${dallas_name}
     resolution: 12
     filters:
       - filter_out: NAN
-

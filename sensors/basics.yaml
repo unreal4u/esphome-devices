@@ -17,4 +17,3 @@ sensor:
   - platform: wifi_signal
     name: "WiFi signal"
     update_interval: 30s
-

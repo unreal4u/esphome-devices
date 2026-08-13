@@ -1,0 +1,471 @@
+substitutions:
+  device_name: trmnl-e-ink-display-1
+  device_friendly_name: TRMNL - e-ink Display
+  device_comment: E-ink display
+
+packages:
+  basics: !include .basics.yaml
+
+esphome:
+  includes:
+    - src/calendar_structs.h
+    - src/calendar_structs.cpp
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_eink_display1
+  homeassistant_services: true
+
+ota:
+  - platform: esphome
+    password: !secret otapwd_eink_display1
+
+# Sets the time on the device based on the information coming from HA
+time:
+  - platform: sntp
+    id: local_time
+    # Denotes Amsterdam: https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
+    #timezone: CET-1CEST,M3.5.0,M10.5.0/3
+    timezone: Europe/Amsterdam
+    servers:
+      - ntp.home.unreal4u.com
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+
+text_sensor:
+  - platform: homeassistant
+    id: active_tariff_sensor
+    name: "Active Tariff"
+    entity_id: sensor.p1_meter_dongle_current_tariff_parsed
+    #filters:
+
+  # Possible states: sunny, clear, partlycloudy, cloudy, partlycloudy-fog, partlycloudy-light-rain, partlycloudy-rain, light-rain, rainy, snowy-rainy, partlycloudy-light-snow, partlycloudy-snow, light-snow, snowy, partlycloudy-lightning or lightning
+  - platform: homeassistant
+    entity_id: weather.buienradar
+    name: "Weather buienradar"
+    id: outside_weather
+
+  - platform: homeassistant
+    entity_id: fan.kelder_controller_fan
+    name: "Fan Kelder"
+    id: fan_kelder
+
+  - platform: homeassistant
+    entity_id: binary_sensor.door_sensor_1_contact
+    name: "Back door opened"
+    id: back_door_open
+
+  - platform: homeassistant
+    entity_id: input_boolean.water_fountain_must_be_cleaned
+    name: "Water fountain needs cleaning"
+    id: water_fountain_must_be_cleaned
+
+  - platform: homeassistant
+    entity_id: input_boolean.dark_mode
+    name: "Dark mode"
+    id: is_dark
+
+  - platform: homeassistant
+    entity_id: input_boolean.night_mode
+    name: "Night mode"
+    id: is_night
+
+sensor:
+  - platform: homeassistant
+    id: outside_temperature
+    name: "Outside Temperature"
+    entity_id: sensor.buienradar_temperature
+  - platform: homeassistant
+    entity_id: sensor.anna_temperature
+    name: "Living room temperature"
+    id: living_room_temperature
+  - platform: homeassistant
+    entity_id: sensor.outside_box_temperature
+    name: "Bedroom temperature"
+    id: bedroom_temperature
+  - platform: homeassistant
+    entity_id: number.number_of_lights_on
+    name: "Number of lights on"
+    id: number_of_lights_on
+  - platform: homeassistant
+    entity_id: counter.vacuum_runs_without_cleaning
+    name: "Vacuum runs without cleaning"
+    id: vacuum_runs_without_cleaning
+  - platform: homeassistant
+    entity_id: sensor.k1c_ef19_progress
+    name: "Printer progress"
+    id: printer_progress
+
+
+interval:
+  - interval: 1min
+    then:
+      - homeassistant.action:
+          action: calendar.get_events
+          data:
+            entity_id: calendar.birthdays, calendar.family_calendar, calendar.holidays_in_the_netherlands
+          data_template:
+            start_date_time: >-
+              {{ now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() }}
+            end_date_time: >-
+              {{ (now() + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat() }}
+          capture_response: true
+          on_success:
+            - lambda: |-
+                ESP_LOGI("calendar", "Processing calendar response...");
+                
+                global_events.clear();
+                std::string output;
+                serializeJson(response, output);
+                
+                int i = 0;
+                bool today = false;
+                auto now_time = id(local_time).now();
+                struct tm time_info = now_time.to_c_tm();
+                char today_buffer[11];
+                strftime(today_buffer, sizeof(today_buffer), "%Y-%m-%d", &time_info);
+                std::string today_str(today_buffer);
+                
+                const char* calendars[] = {"calendar.family_calendar", "calendar.birthdays", "calendar.holidays_in_the_netherlands"};
+                auto ha_data = response["response"];
+                
+                for (const char* cal : calendars) {
+                    const char* cal_id = calendars[i];
+                
+                    if (ha_data[cal].is<JsonObjectConst>()) {
+                        auto events = ha_data[cal]["events"];
+                        size_t events_count = events.size();
+                        std::string cal_name;
+                
+                        if (cal == "calendar.family_calendar") {
+                            cal_name = "family";
+                        }
+                        if (cal == "calendar.birthdays") {
+                            cal_name = "birthdays";
+                        }
+                        if (cal == "calendar.holidays_in_the_netherlands") {
+                            cal_name = "holidays";
+                        }
+                
+                        if (events_count > 0) {
+                            ESP_LOGI("calendar", "  + Calendar %s found with %d events", cal, events_count);
+                            for (size_t event_number = 0; event_number < events_count; event_number++) {
+                                std::string summary = events[event_number]["summary"] | "No Summary";
+                                std::string start   = events[event_number]["start"]   | "Unknown Start";
+                                std::string end     = events[event_number]["end"]     | "Unknown End";
+                
+                                if (start.substr(0, 10) == today_str) {
+                                    today = true;
+                                } else {
+                                    today = false;
+                                }
+                
+                                CalendarEvent new_event;
+                                new_event.cal_name = cal_name;
+                                new_event.summary = summary;
+                                new_event.start = start;
+                                new_event.end = end;
+                                new_event.today = today;
+                                global_events.push_back(new_event);
+                            }
+                        } else {
+                            ESP_LOGI("calendar", "  + Calendar %s found but it has 0 events.", cal);
+                        }
+                    } else {
+                        ESP_LOGW("calendar", "No events in calendar %s found. Full response: ", cal);
+                        ESP_LOGD("calendar", "%s", output.c_str());
+                    }
+                    i++;
+                }
+                
+                for (const auto& event : global_events) {
+                    ESP_LOGD("calendar", "  + Event: %s (Calendar: %s. Starts: %s, ends: %s, is today: %s)", 
+                            event.summary.c_str(), 
+                            event.cal_name.c_str(),
+                            event.start.c_str(), 
+                            event.end.c_str(),
+                            event.today ? "Yes" : "No");
+                }
+                ESP_LOGI("calendar", "Total events stored: %d", global_events.size());
+          on_error:
+            - lambda: |-
+                ESP_LOGE("calendar", "Failed to fetch calendar events from Home Assistant");
+
+# define font to display words
+font:
+  - file: "gfonts://Inter@700"
+    id: font_big
+    size: 55
+    extras:
+      - file: "fonts/materialdesignicons-webfont.ttf"
+        glyphs: [
+          "\U000F06A1", # mdi-home-outline
+        ]
+  - file: "gfonts://Inter@400"
+    id: font_small
+    size: 28
+    extras:
+      - file: "fonts/materialdesignicons-webfont.ttf"
+        glyphs: [
+          "\U000F05E1", # mdi-check-circle-outline
+          "\U000F0766", # mdi-circle-outline
+          "\U000F0026", # mdi-alert
+          "\U000F1238", # mdi-exclamation-thick
+          "\U000F0FD2", # mdi-bed-king
+          "\U000F04B9", # mdi-sofa
+          "\U000F06E8", # mdi-lightbulb-on, shows how many lights are turned on
+          "\U000F081B", # mdi-door-closed, to show back door is open or not
+          "\U000F1278", # mdi-percent-outline, for 3d printer progress
+          "\U000F0210", # mdi-fan, shows whether fan in kelder is turned on or not
+          "\U000F070D", # mdi-robot-vacuum, vacuum cleaner needs cleaning or is stuck
+          "\U000F096B", # mdi-fountain, to indicate whether the water fountain needs cleaning
+          "\U000F059A", # mdi-weather-sunset, to indicate dark mode
+          "\U000F0594", # mdi-weather-night, to indicate night mode
+        ]
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: font_weather
+    size: 48
+    glyphs: [
+      "\U000F0590", # mdi-weather-cloudy
+      #"\U000F0F2F", # mdi-weather-cloudy-alert
+      #"\U000F0E6E", # mdi-weather-cloudy-arrow-right
+      "\U000F0591", # mdi-weather-fog
+      "\U000F0592", # mdi-weather-hail
+      "\U000F0F30", # mdi-weather-hazy
+      #"\U000F0898", # mdi-weather-hurricane
+      "\U000F0593", # mdi-weather-lightning
+      "\U000F067E", # mdi-weather-lightning-rainy
+      "\U000F0594", # mdi-weather-night
+      "\U000F0F31", # mdi-weather-night-partly-cloudy
+      "\U000F0595", # mdi-weather-partly-cloudy
+      "\U000F0F32", # mdi-weather-partly-lightning
+      "\U000F0F33", # mdi-weather-partly-rainy
+      "\U000F0F34", # mdi-weather-partly-snowy
+      "\U000F0F35", # mdi-weather-partly-snowy-rainy
+      "\U000F0596", # mdi-weather-pouring
+      "\U000F0597", # mdi-weather-rainy
+      "\U000F0598", # mdi-weather-snowy
+      "\U000F0F36", # mdi-weather-snowy-heavy
+      "\U000F067F", # mdi-weather-snowy-rainy
+      "\U000F0599", # mdi-weather-sunny
+      #"\U000F0F37", # mdi-weather-sunny-alert
+      "\U000F14E4", # mdi-weather-sunny-off
+      #"\U000F059A", # mdi-weather-sunset
+      #"\U000F059B", # mdi-weather-sunset-down
+      #"\U000F059C", # mdi-weather-sunset-up
+      #"\U000F0F38", # mdi-weather-tornado
+      "\U000F059D", # mdi-weather-windy
+      #"\U000F059E", # mdi-weather-windy-variant
+    ]
+
+# Define colors
+color:
+  - id: color_black
+    red: 0%
+    green: 0%
+    blue: 0%
+    white: 50%
+  - id: color_white
+    red: 0%
+    green: 0%
+    blue: 0%
+    white: 0%
+
+# define SPI interface
+spi:
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+
+display:
+  - platform: waveshare_epaper
+    model: 7.50inv2
+    cs_pin: GPIO44
+    dc_pin: GPIO10
+    reset_pin: GPIO38
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    #full_update_every: 120
+    update_interval: 60s
+    lambda: |-
+      auto time = id(local_time).now();
+      //auto weather_condition = id(outside_weather).state.c_str();
+      std::string weather_condition = id(outside_weather).state;
+      std::string weather_icon = "\U000F0599";
+      std::string display_tariff = "Normal";
+      if (id(active_tariff_sensor).state == "Low") {
+          display_tariff = "Low";
+      }
+
+      // Construct the basics of the entire screen
+      it.filled_rectangle(0, 0, 800, 480);
+      it.filled_rectangle(3, 3, 794, 474, COLOR_OFF);
+      // First third of the screen
+      it.filled_rectangle(0, 0, 800, 160);
+      it.filled_rectangle(3, 3, 794, 154, COLOR_OFF);
+
+      // Time and date rectangles
+      it.filled_rectangle(0, 0, 200, 160);
+      it.filled_rectangle(3, 3, 194, 154, COLOR_OFF);
+      it.strftime(10,  0, id(font_big), "%H:%M", time);
+      it.strftime(15, 65, id(font_small), "%a %d-%m", time);
+
+      // Temperatures overview schema
+      it.filled_rectangle(200, 0, 200, 160);
+      it.filled_rectangle(200, 3, 197, 154, COLOR_OFF);
+      it.line(200, 60, 400, 60);
+
+      // Temperature outside
+      if (weather_condition == "partlycloudy") {
+          weather_icon = "\U000F0595";
+      } else if (weather_condition == "cloudy") {
+          weather_icon = "\U000F0590";
+      } else if (weather_condition == "partlycloudy-fog") {
+          weather_icon = "\U000F0591";
+      } else if (weather_condition == "partlycloudy-light-rain") {
+          weather_icon = "\U000F0F33";
+      } else if (weather_condition == "partlycloudy-rain") {
+          weather_icon = "\U000F0F33";
+      } else if (weather_condition == "light-rain") {
+          weather_icon = "\U000F0F33";
+      } else if (weather_condition == "rainy") {
+          weather_icon = "\U000F0597";
+      } else if (weather_condition == "snowy-rainy") {
+          weather_icon = "\U000F067F";
+      } else if (weather_condition == "partlycloudy-light-snow") {
+          weather_icon = "\U000F0F35";
+      } else if (weather_condition == "partlycloudy-snow") {
+          weather_icon = "\U000F0F34";
+      } else if (weather_condition == "light-snow") {
+          weather_icon = "\U000F0598";
+      } else if (weather_condition == "snowy") {
+          weather_icon = "\U000F0F36";
+      } else if (weather_condition == "partlycloudy-lightning") {
+          weather_icon = "\U000F0F32";
+      } else if (weather_condition == "lightning") {
+          weather_icon = "\U000F0593";
+      } else if (weather_condition == "fog") {
+          weather_icon = "\U000F0591";
+      }
+      it.printf(202, 5, id(font_weather), "%s", weather_icon.c_str());
+      it.printf(250, 0, id(font_big), "%0.0f°C", id(outside_temperature).state);
+
+      // Display temperatures inside the house
+      it.printf(205, 75, id(font_big), "\U000F06A1");
+      it.printf(260, 75, id(font_small), "\U000F0FD2 %0.1f°C", id(bedroom_temperature).state);
+      it.printf(260, 110, id(font_small), "\U000F04B9 %0.1f°C", id(living_room_temperature).state);
+
+      // Energy tariff setup
+      it.filled_rectangle(400, 0, 200, 160);
+      it.filled_rectangle(400, 3, 197, 154, COLOR_OFF);
+      it.line(400, 42, 600, 42);
+      it.print(412, 2, id(font_small), "Electric tariff");
+
+      // Electric tariff formatting
+      if (display_tariff == "Normal") {
+          it.filled_rectangle(400, 42, 600, 160);
+          it.printf(402, 60, id(font_big), color_white, "Normal");
+      } else { 
+          it.printf(440, 60, id(font_big), "Low");
+      }
+
+      // Status rectangles
+      it.filled_rectangle(600, 0, 200, 160);
+      it.filled_rectangle(600, 3, 197, 154, COLOR_OFF);
+      // Lights on
+      it.printf(602, 3, id(font_small), "\U000F06E8");
+      it.printf(642, 3, id(font_small), "%0.0f", id(number_of_lights_on).state);
+      // Back door open
+      it.printf(602, 33, id(font_small), "\U000F081B");
+      if (id(back_door_open).state == "on") {
+          // Warning symbol when open
+          it.printf(642, 33, id(font_small), "\U000F0026");
+      } else {
+          // Everything is ok when it is closed
+          it.printf(642, 33, id(font_small), "\U000F05E1");
+      }
+      // Fan kelderisita de Rebeca on calendar family on screen (x: 12, y: 394019)
+      it.printf(602, 63, id(font_small), "\U000F0210");
+      if (id(fan_kelder).state == "on") {
+          it.printf(642, 63, id(font_small), "\U000F05E1");
+      } else {
+          it.printf(642, 63, id(font_small), "\U000F0766");
+      }
+      // Vacuum need cleaning
+      it.printf(602, 93, id(font_small), "\U000F070D");
+      if (id(vacuum_runs_without_cleaning).state > 1) {
+          it.printf(642, 93, id(font_small), "\U000F1238");
+      }
+      // Fountain needs cleaning
+      it.printf(602, 123, id(font_small), "\U000F096B");
+      if (id(water_fountain_must_be_cleaned).state == "on") {
+          // Warning symbol when it needs cleaning
+          it.printf(642, 123, id(font_small), "\U000F0026");
+      }
+
+      // Second column
+      // Dark mode
+      it.printf(710, 3, id(font_small), "\U000F059A");
+      if (id(is_dark).state == "on") {
+          it.printf(750, 3, id(font_small), "\U000F05E1");
+      } else {
+          it.printf(750, 3, id(font_small), "\U000F0766");
+      }
+      // Night mode
+      it.printf(710, 33, id(font_small), "\U000F0594");
+      if (id(is_night).state == "on") {
+          it.printf(750, 33, id(font_small), "\U000F05E1");
+      } else {
+          it.printf(750, 33, id(font_small), "\U000F0766");
+      }
+
+      // Todays calendar items
+      it.filled_rectangle(0, 160, 400, 160);
+      it.filled_rectangle(3, 160, 394, 157, COLOR_OFF);
+
+      // Tomorrows calendar items
+      it.filled_rectangle(400, 160, 400, 160);
+      it.filled_rectangle(400, 160, 397, 157, COLOR_OFF);
+
+      auto get_time_str = [](std::string datetime_string) -> std::string {
+          // Timed format: 2026-01-28T10:00:00+01:00
+          // The 'T' is at index 10. HH:MM starts at index 11.
+          if (datetime_string.length() > 11 && datetime_string[10] == 'T') {
+              return datetime_string.substr(11, 5);
+          }
+          return "All Day";
+      };
+
+      int x, y;
+      int today_y = 160;
+      int tomorrow_y = 160;
+      int line_height = 30;
+      for (const auto& event : global_events) {
+          std::string start_time_label = get_time_str(event.start);
+          std::string end_time_label = get_time_str(event.end);
+          if (end_time_label.c_str() == "All Day") {
+              end_time_label = "";
+          }
+
+          if (event.today) {
+              y = today_y;
+              today_y += line_height;
+              x = 12;
+          } else {
+              y = tomorrow_y;
+              tomorrow_y += line_height;
+              x = 412;
+          }
+
+          ESP_LOGD("calendar", "Printing event %s on calendar %s (from %s until %s) on screen (x: %d, y: %d)", event.summary.c_str(), event.cal_name.c_str(), start_time_label.c_str(), end_time_label.c_str(), x, y);
+          it.printf(x, y, id(font_small), "%s - %s: %s", start_time_label.c_str(), end_time_label.c_str(), event.summary.c_str());
+          //it.line(x - 12, y - 160, x - 12, y);
+      }
+
+      it.printf(5, 330, id(font_small), "Weather condition: %s", weather_condition.c_str());
