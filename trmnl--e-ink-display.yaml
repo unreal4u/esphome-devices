@@ -10,11 +10,25 @@ esphome:
   includes:
     - src/calendar_structs.h
     - src/calendar_structs.cpp
+  on_boot:
+    # Enable the battery divider early so the first ADC sample is valid
+    - priority: 600
+      then:
+        - script.execute: sample_battery
+    - priority: -100
+      then:
+        # Give Home Assistant a moment to push the initial sensor states
+        - delay: 20s
+        - script.execute: update_dashboard
 
 esp32:
   board: esp32-s3-devkitc-1
   framework:
     type: arduino
+
+psram:
+  mode: octal
+  speed: 80MHz
 
 # Enable Home Assistant API
 api:
@@ -37,13 +51,20 @@ time:
       - ntp.home.unreal4u.com
       - 0.pool.ntp.org
       - 1.pool.ntp.org
+    on_time:
+      # Refresh the e-paper once per minute at HH:MM:01
+      - seconds: 1
+        then:
+          - script.execute: update_dashboard
 
 text_sensor:
   - platform: homeassistant
     id: active_tariff_sensor
     name: "Active Tariff"
     entity_id: sensor.p1_meter_dongle_current_tariff_parsed
-    #filters:
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
   # Possible states: sunny, clear, partlycloudy, cloudy, partlycloudy-fog, partlycloudy-light-rain, partlycloudy-rain, light-rain, rainy, snowy-rainy, partlycloudy-light-snow, partlycloudy-snow, light-snow, snowy, partlycloudy-lightning or lightning
   - platform: homeassistant
@@ -55,26 +76,49 @@ text_sensor:
     entity_id: fan.kelder_controller_fan
     name: "Fan Kelder"
     id: fan_kelder
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
   - platform: homeassistant
     entity_id: binary_sensor.door_sensor_1_contact
     name: "Back door opened"
     id: back_door_open
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
   - platform: homeassistant
     entity_id: input_boolean.water_fountain_must_be_cleaned
     name: "Water fountain needs cleaning"
     id: water_fountain_must_be_cleaned
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
   - platform: homeassistant
     entity_id: input_boolean.dark_mode
     name: "Dark mode"
     id: is_dark
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
   - platform: homeassistant
     entity_id: input_boolean.night_mode
     name: "Night mode"
     id: is_night
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
+
+  - platform: homeassistant
+    entity_id: binary_sensor.f1_race_week
+    name: "F1 race week"
+    id: f1_race_week
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
 sensor:
   - platform: homeassistant
@@ -82,9 +126,9 @@ sensor:
     name: "Outside Temperature"
     entity_id: sensor.buienradar_temperature
   - platform: homeassistant
-    entity_id: sensor.anna_temperature
-    name: "Living room temperature"
-    id: living_room_temperature
+    entity_id: sensor.temperature_downstairs
+    name: "Downstairs temperature"
+    id: downstairs_temperature
   - platform: homeassistant
     entity_id: sensor.outside_box_temperature
     name: "Bedroom temperature"
@@ -93,17 +137,405 @@ sensor:
     entity_id: number.number_of_lights_on
     name: "Number of lights on"
     id: number_of_lights_on
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
   - platform: homeassistant
     entity_id: counter.vacuum_runs_without_cleaning
     name: "Vacuum runs without cleaning"
     id: vacuum_runs_without_cleaning
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
   - platform: homeassistant
     entity_id: sensor.k1c_ef19_progress
     name: "Printer progress"
     id: printer_progress
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
 
+  # TRMNL OG DIY kit: GPIO1 senses battery through a 2x divider, GPIO6 enables it
+  - platform: adc
+    pin: GPIO1
+    name: "Battery Voltage"
+    id: battery_voltage
+    device_class: voltage
+    state_class: measurement
+    entity_category: diagnostic
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    attenuation: 12db
+    update_interval: never
+    filters:
+      - multiply: 2.0
+
+  - platform: template
+    name: "Battery Level"
+    id: battery_level
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:battery
+    update_interval: never
+    lambda: 'return id(battery_voltage).state;'
+    filters:
+      - calibrate_linear:
+          - 4.15 -> 100.0
+          - 3.96 -> 90.0
+          - 3.91 -> 80.0
+          - 3.85 -> 70.0
+          - 3.80 -> 60.0
+          - 3.75 -> 50.0
+          - 3.68 -> 40.0
+          - 3.58 -> 30.0
+          - 3.49 -> 20.0
+          - 3.41 -> 10.0
+          - 3.30 -> 5.0
+          - 3.27 -> 0.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+    on_value:
+      then:
+        # Only refresh the panel when the low-battery notification appears or clears
+        - if:
+            condition:
+              lambda: |-
+                static bool was_low = false;
+                bool is_low = !isnan(x) && x < 20.0f;
+                bool changed = is_low != was_low;
+                was_low = is_low;
+                return changed;
+            then:
+              - script.execute: request_dashboard_update
+
+# GPIO6 gates the battery voltage divider; leave it off between samples
+output:
+  - platform: gpio
+    pin: GPIO6
+    id: battery_adc_enable
+
+globals:
+  # Minute currently drawn on the panel, -1 when the panel holds an unsynced time
+  - id: last_rendered_minute
+    type: int
+    restore_value: false
+    initial_value: '-1'
+
+script:
+  # Turn the divider on just long enough to take a stable ADC reading
+  - id: sample_battery
+    mode: single
+    then:
+      - output.turn_on: battery_adc_enable
+      - delay: 50ms
+      - component.update: battery_voltage
+      - component.update: battery_level
+      - output.turn_off: battery_adc_enable
+
+  # Coalesce related Home Assistant state changes into one e-paper refresh.
+  # Restart mode resets the short delay whenever another notification changes.
+  - id: request_dashboard_update
+    mode: restart
+    then:
+      - delay: 500ms
+      - script.execute: update_dashboard
+
+  - id: update_dashboard
+    mode: single
+    then:
+      - logger.log:
+          tag: "dashboard"
+          format: "Refreshing dashboard (%d calendar events)"
+          args: ['global_events.size()']
+      - lambda: |-
+          auto now_time = id(local_time).now();
+          id(last_rendered_minute) = now_time.is_valid() ? (int) now_time.minute : -1;
+      - lvgl.label.update:
+          id: lbl_time
+          text:
+            time_format: "%H:%M"
+            time: local_time
+      - lvgl.label.update:
+          id: lbl_date
+          text:
+            time_format: "\U000F00ED %d-%m-%y"
+            time: local_time
+      # Invert the cell of the current weekday. Like the rest of this panel the
+      # colours are swapped: 0x000000 is blank paper, 0xFFFFFF is ink.
+      - lambda: |-
+          lv_obj_t *day_cells[7] = {
+            id(day_mon), id(day_tue), id(day_wed), id(day_thu), id(day_fri), id(day_sat), id(day_sun),
+          };
+          auto now_time = id(local_time).now();
+          if (!now_time.is_valid()) {
+            return;
+          }
+          lv_color_t paper = lv_color_hex(0x000000);
+          lv_color_t ink = lv_color_hex(0xFFFFFF);
+          // ESPTime counts day_of_week from 1 = Sunday, the strip starts on Monday
+          int active_cell = (now_time.day_of_week + 5) % 7;
+          for (int cell = 0; cell < 7; cell++) {
+            bool is_today = cell == active_cell;
+            lv_obj_set_style_bg_color(day_cells[cell], is_today ? ink : paper, LV_PART_MAIN);
+            lv_obj_set_style_text_color(day_cells[cell], is_today ? paper : ink, LV_PART_MAIN);
+          }
+      - lvgl.label.update:
+          id: lbl_weather_icon
+          text: !lambda |-
+            std::string weather_condition = id(outside_weather).state;
+            if (weather_condition == "partlycloudy") {
+              return "\U000F0595";
+            } else if (weather_condition == "cloudy") {
+              return "\U000F0590";
+            } else if (weather_condition == "partlycloudy-fog" || weather_condition == "fog") {
+              return "\U000F0591";
+            } else if (weather_condition == "partlycloudy-light-rain" ||
+                       weather_condition == "partlycloudy-rain" ||
+                       weather_condition == "light-rain") {
+              return "\U000F0F33";
+            } else if (weather_condition == "rainy") {
+              return "\U000F0597";
+            } else if (weather_condition == "snowy-rainy") {
+              return "\U000F067F";
+            } else if (weather_condition == "partlycloudy-light-snow") {
+              return "\U000F0F35";
+            } else if (weather_condition == "partlycloudy-snow") {
+              return "\U000F0F34";
+            } else if (weather_condition == "light-snow") {
+              return "\U000F0598";
+            } else if (weather_condition == "snowy") {
+              return "\U000F0F36";
+            } else if (weather_condition == "partlycloudy-lightning") {
+              return "\U000F0F32";
+            } else if (weather_condition == "lightning") {
+              return "\U000F0593";
+            }
+            return "\U000F0599";
+      - lvgl.label.update:
+          id: lbl_outside_temp
+          text:
+            format: "%0.0f"
+            args: ['id(outside_temperature).state']
+      - lvgl.label.update:
+          id: lbl_bedroom_temp
+          text:
+            format: "%0.1f"
+            args: ['id(bedroom_temperature).state']
+      - lvgl.label.update:
+          id: lbl_downstairs_temp
+          text:
+            format: "%0.1f"
+            args: ['id(downstairs_temperature).state']
+      # Slot 1 permanently holds the electricity tariff, inverted while the
+      # tariff is normal so that the expensive hours stand out. The rest of the
+      # feed only lists what needs attention; night mode takes precedence over
+      # dark mode, so those two never occupy separate slots at the same time.
+      - lambda: |-
+          bool low_tariff = id(active_tariff_sensor).state == "Low";
+          lv_color_t paper = lv_color_hex(0x000000);
+          lv_color_t ink = lv_color_hex(0xFFFFFF);
+          lv_label_set_text(id(notification_1),
+                            low_tariff ? "\U000F0D3E Tariff low" : "\U000F0D3E Tariff normal");
+          lv_obj_set_style_bg_color(id(notification_1), low_tariff ? paper : ink, LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(notification_1), low_tariff ? ink : paper, LV_PART_MAIN);
+
+          lv_obj_t *notification_labels[9] = {
+            id(notification_2), id(notification_3), id(notification_4), id(notification_5),
+            id(notification_6), id(notification_7), id(notification_8), id(notification_9),
+            id(notification_10),
+          };
+          // Tariff owns slot 1; the nine slots below hold every other alert.
+          std::string notifications[9];
+          int count = 0;
+
+          if (!isnan(id(number_of_lights_on).state) && id(number_of_lights_on).state > 0) {
+            char lights[32];
+            int lights_on = (int) id(number_of_lights_on).state;
+            snprintf(lights, sizeof(lights), "\U000F06E8 %d light%s",
+                     lights_on, lights_on == 1 ? "" : "s");
+            notifications[count++] = lights;
+          }
+          if (id(back_door_open).state == "on") {
+            notifications[count++] = "\U000F081B Back door open";
+          }
+          if (id(fan_kelder).state == "on") {
+            notifications[count++] = "\U000F0210 Kelder fan";
+          }
+          if (!isnan(id(vacuum_runs_without_cleaning).state) &&
+              id(vacuum_runs_without_cleaning).state > 1) {
+            notifications[count++] = "\U000F070D Clean vacuum";
+          }
+          if (!isnan(id(printer_progress).state) &&
+              id(printer_progress).state > 0 &&
+              id(printer_progress).state < 100) {
+            char printing[32];
+            snprintf(printing, sizeof(printing), "\U000F0E5B Printing %0.0f%%",
+                     id(printer_progress).state);
+            notifications[count++] = printing;
+          }
+          if (id(is_night).state == "on") {
+            notifications[count++] = "\U000F0594 Night mode";
+          } else if (id(is_dark).state == "on") {
+            notifications[count++] = "\U000F059A Dark mode";
+          }
+          if (id(water_fountain_must_be_cleaned).state == "on") {
+            notifications[count++] = "\U000F096B Clean fountain";
+          }
+          if (id(f1_race_week).state == "on") {
+            notifications[count++] = "\U000F07AC Rawe Ceek";
+          }
+          if (!isnan(id(battery_level).state) && id(battery_level).state < 20.0f) {
+            char battery[32];
+            snprintf(battery, sizeof(battery), "\U000F0083 Battery %0.0f%%",
+                     id(battery_level).state);
+            notifications[count++] = battery;
+          }
+
+          for (int slot = 0; slot < 9; slot++) {
+            if (slot < count) {
+              lv_label_set_text(notification_labels[slot], notifications[slot].c_str());
+              lv_obj_remove_flag(notification_labels[slot], LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_add_flag(notification_labels[slot], LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+      # Fill the two calendar columns: column 0 is today, column 1 is tomorrow.
+      # Each column keeps the four earliest events. Every event occupies one row
+      # with a fixed left gutter: timed events show their start over their end
+      # time, all-day events show a calendar icon instead.
+      - lambda: |-
+          lv_obj_t *slots[2][4] = {
+            {id(cal_today_slot_1), id(cal_today_slot_2), id(cal_today_slot_3), id(cal_today_slot_4)},
+            {id(cal_tomorrow_slot_1), id(cal_tomorrow_slot_2), id(cal_tomorrow_slot_3), id(cal_tomorrow_slot_4)},
+          };
+          lv_obj_t *rails[2][4] = {
+            {id(cal_today_rail_1), id(cal_today_rail_2), id(cal_today_rail_3), id(cal_today_rail_4)},
+            {id(cal_tomorrow_rail_1), id(cal_tomorrow_rail_2), id(cal_tomorrow_rail_3), id(cal_tomorrow_rail_4)},
+          };
+          lv_obj_t *event_boxes[2] = {id(cal_today_events), id(cal_tomorrow_events)};
+          lv_obj_t *empty_boxes[2] = {id(cal_today_empty), id(cal_tomorrow_empty)};
+          lv_obj_t *rail_lines[2][4] = {
+            {id(cal_today_line_1), id(cal_today_line_2), id(cal_today_line_3), id(cal_today_line_4)},
+            {id(cal_tomorrow_line_1), id(cal_tomorrow_line_2), id(cal_tomorrow_line_3), id(cal_tomorrow_line_4)},
+          };
+          lv_obj_t *time_labels[2][4] = {
+            {id(cal_today_time_1), id(cal_today_time_2), id(cal_today_time_3), id(cal_today_time_4)},
+            {id(cal_tomorrow_time_1), id(cal_tomorrow_time_2), id(cal_tomorrow_time_3), id(cal_tomorrow_time_4)},
+          };
+          lv_obj_t *title_labels[2][4] = {
+            {id(cal_today_title_1), id(cal_today_title_2), id(cal_today_title_3), id(cal_today_title_4)},
+            {id(cal_tomorrow_title_1), id(cal_tomorrow_title_2), id(cal_tomorrow_title_3), id(cal_tomorrow_title_4)},
+          };
+
+          auto now_time = id(local_time).now();
+          if (!now_time.is_valid()) {
+            return;
+          }
+          const std::string column_dates[2] = {
+            now_time.strftime("%Y-%m-%d"),
+            ESPTime::from_epoch_local(now_time.timestamp + 86400).strftime("%Y-%m-%d"),
+          };
+
+          // A multi-day event has to appear on every day it covers, so match on
+          // the date range instead of on the event's start date alone. Home
+          // Assistant reports the end date of all-day events exclusively.
+          auto occurs_on = [](const CalendarEvent &event, const std::string &date) {
+            if (event.start.length() < 10 || event.end.length() < 10 || event.start.substr(0, 10) > date) {
+              return false;
+            }
+            bool all_day = event.start.length() <= 11 || event.start[10] != 'T';
+            return all_day ? date < event.end.substr(0, 10) : date <= event.end.substr(0, 10);
+          };
+
+          // Keep the four earliest events per column. ISO timestamps sort
+          // chronologically as plain strings, and all-day events ("2026-08-14")
+          // sort before timed ones on the same date.
+          const CalendarEvent *shown[2][4] = {};
+          int used[2] = {0, 0};
+          for (int column = 0; column < 2; column++) {
+            for (const auto &event : global_events) {
+              if (!occurs_on(event, column_dates[column])) {
+                continue;
+              }
+              int position = used[column];
+              while (position > 0 && shown[column][position - 1]->start > event.start) {
+                position--;
+              }
+              if (position >= 4) {
+                continue;
+              }
+              for (int i = (used[column] < 4 ? used[column] : 3); i > position; i--) {
+                shown[column][i] = shown[column][i - 1];
+              }
+              shown[column][position] = &event;
+              if (used[column] < 4) {
+                used[column]++;
+              }
+            }
+          }
+
+          for (int column = 0; column < 2; column++) {
+            for (int slot = 0; slot < 4; slot++) {
+              const CalendarEvent *event = shown[column][slot];
+              if (event == nullptr) {
+                lv_obj_add_flag(slots[column][slot], LV_OBJ_FLAG_HIDDEN);
+                continue;
+              }
+
+              bool timed = event->start.length() > 11 && event->start[10] == 'T';
+              if (timed) {
+                std::string when = event->start.substr(11, 5);
+                if (event->end.length() > 11 && event->end[10] == 'T') {
+                  when += " - " + event->end.substr(11, 5);
+                }
+                lv_label_set_text(time_labels[column][slot], when.c_str());
+              } else {
+                lv_label_set_text(time_labels[column][slot], "All day");
+              }
+              lv_label_set_text(title_labels[column][slot], event->summary.c_str());
+              // Default every rail line to full height so it joins the row
+              // below; the last event's line is trimmed to a bullet afterwards.
+              lv_obj_set_height(rail_lines[column][slot], lv_pct(100));
+              lv_obj_remove_flag(rails[column][slot], LV_OBJ_FLAG_HIDDEN);
+              lv_obj_remove_flag(slots[column][slot], LV_OBJ_FLAG_HIDDEN);
+            }
+            // Stop the timeline at the last event: its line only reaches the
+            // dot instead of trailing down through the empty rows below. With
+            // no events at all the timeline gives way to the centred
+            // placeholder, which fills the panel instead of one lonely row.
+            if (used[column] > 0) {
+              lv_obj_set_height(rail_lines[column][used[column] - 1], 13);
+              lv_obj_remove_flag(event_boxes[column], LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(empty_boxes[column], LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_add_flag(event_boxes[column], LV_OBJ_FLAG_HIDDEN);
+              lv_obj_remove_flag(empty_boxes[column], LV_OBJ_FLAG_HIDDEN);
+            }
+          }
 
 interval:
+  - interval: 5min
+    then:
+      - script.execute: sample_battery
+
+  # The on_time trigger above goes quiet whenever SNTP corrects the clock
+  # backwards by less than 15 minutes: ESPHome's cron check skips every second
+  # that it has already seen, so it waits for the clock to catch up again. Catch
+  # that (and any other missed minute) by comparing what is on the panel against
+  # the current time.
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              auto now_time = id(local_time).now();
+              return now_time.is_valid() && (int) now_time.minute != id(last_rendered_minute);
+          then:
+            - script.execute: update_dashboard
+
   - interval: 1min
     then:
       - homeassistant.action:
@@ -119,53 +551,52 @@ interval:
           on_success:
             - lambda: |-
                 ESP_LOGI("calendar", "Processing calendar response...");
-                
+
                 global_events.clear();
                 std::string output;
                 serializeJson(response, output);
-                
-                int i = 0;
+
                 bool today = false;
                 auto now_time = id(local_time).now();
                 struct tm time_info = now_time.to_c_tm();
                 char today_buffer[11];
                 strftime(today_buffer, sizeof(today_buffer), "%Y-%m-%d", &time_info);
                 std::string today_str(today_buffer);
-                
+
                 const char* calendars[] = {"calendar.family_calendar", "calendar.birthdays", "calendar.holidays_in_the_netherlands"};
                 auto ha_data = response["response"];
-                
+
                 for (const char* cal : calendars) {
-                    const char* cal_id = calendars[i];
-                
+                    std::string cal_entity(cal);
+
                     if (ha_data[cal].is<JsonObjectConst>()) {
                         auto events = ha_data[cal]["events"];
                         size_t events_count = events.size();
                         std::string cal_name;
-                
-                        if (cal == "calendar.family_calendar") {
+
+                        if (cal_entity == "calendar.family_calendar") {
                             cal_name = "family";
                         }
-                        if (cal == "calendar.birthdays") {
+                        if (cal_entity == "calendar.birthdays") {
                             cal_name = "birthdays";
                         }
-                        if (cal == "calendar.holidays_in_the_netherlands") {
+                        if (cal_entity == "calendar.holidays_in_the_netherlands") {
                             cal_name = "holidays";
                         }
-                
+
                         if (events_count > 0) {
                             ESP_LOGI("calendar", "  + Calendar %s found with %d events", cal, events_count);
                             for (size_t event_number = 0; event_number < events_count; event_number++) {
                                 std::string summary = events[event_number]["summary"] | "No Summary";
                                 std::string start   = events[event_number]["start"]   | "Unknown Start";
                                 std::string end     = events[event_number]["end"]     | "Unknown End";
-                
+
                                 if (start.substr(0, 10) == today_str) {
                                     today = true;
                                 } else {
                                     today = false;
                                 }
-                
+
                                 CalendarEvent new_event;
                                 new_event.cal_name = cal_name;
                                 new_event.summary = summary;
@@ -181,14 +612,13 @@ interval:
                         ESP_LOGW("calendar", "No events in calendar %s found. Full response: ", cal);
                         ESP_LOGD("calendar", "%s", output.c_str());
                     }
-                    i++;
                 }
-                
+
                 for (const auto& event : global_events) {
-                    ESP_LOGD("calendar", "  + Event: %s (Calendar: %s. Starts: %s, ends: %s, is today: %s)", 
-                            event.summary.c_str(), 
+                    ESP_LOGD("calendar", "  + Event: %s (Calendar: %s. Starts: %s, ends: %s, is today: %s)",
+                            event.summary.c_str(),
                             event.cal_name.c_str(),
-                            event.start.c_str(), 
+                            event.start.c_str(),
                             event.end.c_str(),
                             event.today ? "Yes" : "No");
                 }
@@ -202,35 +632,64 @@ font:
   - file: "gfonts://Inter@700"
     id: font_big
     size: 55
-    extras:
-      - file: "fonts/materialdesignicons-webfont.ttf"
-        glyphs: [
-          "\U000F06A1", # mdi-home-outline
-        ]
+    bpp: 1
   - file: "gfonts://Inter@400"
     id: font_small
     size: 28
+    bpp: 1
+    # Calendar summaries contain accented characters, which the default
+    # GF_Latin_Kernel glyphset does not cover
+    glyphsets:
+      - GF_Latin_Core
+    # Inter does not include the combining double acute (U+030B) from
+    # GF_Latin_Core; precomposed ő/ű still render fine.
+    ignore_missing_glyphs: true
     extras:
       - file: "fonts/materialdesignicons-webfont.ttf"
         glyphs: [
-          "\U000F05E1", # mdi-check-circle-outline
-          "\U000F0766", # mdi-circle-outline
-          "\U000F0026", # mdi-alert
-          "\U000F1238", # mdi-exclamation-thick
-          "\U000F0FD2", # mdi-bed-king
-          "\U000F04B9", # mdi-sofa
-          "\U000F06E8", # mdi-lightbulb-on, shows how many lights are turned on
-          "\U000F081B", # mdi-door-closed, to show back door is open or not
-          "\U000F1278", # mdi-percent-outline, for 3d printer progress
-          "\U000F0210", # mdi-fan, shows whether fan in kelder is turned on or not
-          "\U000F070D", # mdi-robot-vacuum, vacuum cleaner needs cleaning or is stuck
-          "\U000F096B", # mdi-fountain, to indicate whether the water fountain needs cleaning
-          "\U000F059A", # mdi-weather-sunset, to indicate dark mode
-          "\U000F0594", # mdi-weather-night, to indicate night mode
+          "\U000F00ED", # mdi-calendar, prefixes the date under the clock
         ]
+  - file: "gfonts://Inter@700"
+    id: font_medium
+    size: 40
+    bpp: 1
+  # Section headers and weekday cells
+  - file: "gfonts://Inter@700"
+    id: font_header
+    size: 22
+    bpp: 1
+  # Notification feed. Regular weight body text; digits are pulled from Inter
+  # bold so counts such as the lights total stand out without a second label.
+  - file: "gfonts://Inter@400"
+    id: font_notification
+    size: 24
+    bpp: 1
+    extras:
+      - file: "gfonts://Inter@700"
+        glyphs: "0123456789"
+      - file: "fonts/materialdesignicons-webfont.ttf"
+        glyphs: [
+          "\U000F0D3E", # mdi-transmission-tower, electricity tariff
+          "\U000F06E8", # mdi-lightbulb-on
+          "\U000F081B", # mdi-door-closed
+          "\U000F0210", # mdi-fan
+          "\U000F070D", # mdi-robot-vacuum
+          "\U000F0E5B", # mdi-printer-3d-nozzle
+          "\U000F059A", # mdi-weather-sunset
+          "\U000F0594", # mdi-weather-night
+          "\U000F096B", # mdi-fountain
+          "\U000F07AC", # mdi-car-sports, F1 race week
+          "\U000F0083", # mdi-battery-alert, low battery
+        ]
+  # Start/end times of calendar events
+  - file: "gfonts://Inter@400"
+    id: font_tiny
+    size: 20
+    bpp: 1
   - file: "fonts/materialdesignicons-webfont.ttf"
     id: font_weather
     size: 48
+    bpp: 1
     glyphs: [
       "\U000F0590", # mdi-weather-cloudy
       #"\U000F0F2F", # mdi-weather-cloudy-alert
@@ -264,18 +723,13 @@ font:
       #"\U000F059E", # mdi-weather-windy-variant
     ]
 
-# Define colors
+# This panel treats pure black as "no ink" and anything else as "ink", so the
+# values below are deliberately swapped relative to their names.
 color:
-  - id: color_black
-    red: 0%
-    green: 0%
-    blue: 0%
-    white: 50%
-  - id: color_white
-    red: 0%
-    green: 0%
-    blue: 0%
-    white: 0%
+  - id: paper_white
+    hex: "000000"
+  - id: paper_black
+    hex: "FFFFFF"
 
 # define SPI interface
 spi:
@@ -284,188 +738,1184 @@ spi:
 
 display:
   - platform: waveshare_epaper
-    model: 7.50inv2
+    id: epaper
+    model: 7.50inv2p
     cs_pin: GPIO44
     dc_pin: GPIO10
     reset_pin: GPIO38
     busy_pin:
       number: GPIO4
       inverted: true
-    #full_update_every: 120
-    update_interval: 60s
-    lambda: |-
-      auto time = id(local_time).now();
-      //auto weather_condition = id(outside_weather).state.c_str();
-      std::string weather_condition = id(outside_weather).state;
-      std::string weather_icon = "\U000F0599";
-      std::string display_tariff = "Normal";
-      if (id(active_tariff_sensor).state == "Low") {
-          display_tariff = "Low";
-      }
+    auto_clear_enabled: false
+    update_interval: never
+    full_update_every: 4
 
-      // Construct the basics of the entire screen
-      it.filled_rectangle(0, 0, 800, 480);
-      it.filled_rectangle(3, 3, 794, 474, COLOR_OFF);
-      // First third of the screen
-      it.filled_rectangle(0, 0, 800, 160);
-      it.filled_rectangle(3, 3, 794, 154, COLOR_OFF);
+lvgl:
+  displays:
+    - epaper
+  buffer_size: 25%
+  color_depth: 16
+  default_font: font_small
+  on_draw_end:
+    - component.update: epaper
+  style_definitions:
+    # Panels sit edge to edge, so each one only draws the sides that are not
+    # already drawn by its neighbour. That keeps every line on the screen a
+    # single 2px stroke instead of two borders stacked next to each other.
+    - id: panel_style
+      bg_color: paper_white
+      bg_opa: COVER
+      border_color: paper_black
+      border_width: 2
+      radius: 0
+      pad_all: 4
+  bottom_layer:
+    bg_color: paper_white
+    bg_opa: COVER
+  pages:
+    - id: main_page
+      bg_color: paper_white
+      bg_opa: COVER
+      widgets:
+        # Time / date panel. No padding, so the day-of-week strip can run the
+        # full width of the panel and let its cell borders line up with the
+        # panel borders instead of floating inside them.
+        - obj:
+            x: 0
+            y: 0
+            width: 200
+            height: 160
+            styles: panel_style
+            border_side: [TOP, BOTTOM, LEFT, RIGHT]
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label:
+                  id: lbl_time
+                  align: TOP_MID
+                  y: 4
+                  text_font: font_big
+                  text_color: paper_black
+                  text: "--:--"
+              - label:
+                  id: lbl_date
+                  align: TOP_MID
+                  y: 74
+                  text_font: font_small
+                  text_color: paper_black
+                  text: "---"
+              # Day-of-week strip, flush with the bottom of the panel. The cells
+              # only draw their top and right edges, so together they form one
+              # horizontal rule with dividers, and the panel's own borders close
+              # off the row. The widths add up to the 196px of content width.
+              - obj:
+                  x: 0
+                  y: 122
+                  width: 100%
+                  height: 34
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    pad_column: 0
+                  widgets:
+                    - label:
+                        id: day_mon
+                        width: 26
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP, RIGHT]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "M"
+                    - label:
+                        id: day_tue
+                        width: 26
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP, RIGHT]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "T"
+                    - label:
+                        id: day_wed
+                        width: 26
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP, RIGHT]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "W"
+                    - label:
+                        id: day_thu
+                        width: 26
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP, RIGHT]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "T"
+                    - label:
+                        id: day_fri
+                        width: 26
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP, RIGHT]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "F"
+                    - label:
+                        id: day_sat
+                        width: 33
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP, RIGHT]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "Sa"
+                    - label:
+                        id: day_sun
+                        width: 33
+                        height: 34
+                        bg_color: paper_white
+                        bg_opa: COVER
+                        border_color: paper_black
+                        border_width: 2
+                        border_side: [TOP]
+                        radius: 0
+                        pad_top: 2
+                        text_font: font_header
+                        text_color: paper_black
+                        text_align: CENTER
+                        text: "Su"
 
-      // Time and date rectangles
-      it.filled_rectangle(0, 0, 200, 160);
-      it.filled_rectangle(3, 3, 194, 154, COLOR_OFF);
-      it.strftime(10,  0, id(font_big), "%H:%M", time);
-      it.strftime(15, 65, id(font_small), "%a %d-%m", time);
+        # Temperatures panel. Every row is a flex row aligned on its bottom edge
+        # so the small degree suffix follows the number whatever its width, and
+        # the pad_bottom values lift each suffix onto the number's baseline.
+        - obj:
+            x: 200
+            y: 0
+            width: 200
+            height: 160
+            styles: panel_style
+            border_side: [TOP, BOTTOM, RIGHT]
+            scrollable: false
+            widgets:
+              - obj:
+                  x: 0
+                  y: 0
+                  width: 100%
+                  height: 68
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    flex_align_cross: END
+                    pad_column: 6
+                  widgets:
+                    - label:
+                        id: lbl_weather_icon
+                        pad_bottom: 10
+                        text_font: font_weather
+                        text_color: paper_black
+                        text: "\U000F0599"
+                    - label:
+                        id: lbl_outside_temp
+                        text_font: font_big
+                        text_color: paper_black
+                        text: "--"
+                    - label:
+                        pad_bottom: 8
+                        text_font: font_small
+                        text_color: paper_black
+                        text: "°C"
+              # Pulled out over the panel padding so the rule reaches the
+              # panel borders on both sides
+              - obj:
+                  x: -4
+                  y: 70
+                  width: 196
+                  height: 2
+                  bg_color: paper_black
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+              - obj:
+                  x: 0
+                  y: 78
+                  width: 100%
+                  height: 34
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: END
+                    pad_column: 3
+                  widgets:
+                    - label:
+                        long_mode: CLIP
+                        text_font: font_small
+                        text_color: paper_black
+                        text: "Up"
+                    - obj:
+                        width: SIZE_CONTENT
+                        height: 100%
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: END
+                          pad_column: 3
+                        widgets:
+                          - label:
+                              id: lbl_bedroom_temp
+                              long_mode: CLIP
+                              text_font: font_small
+                              text_color: paper_black
+                              text: "--.-"
+                          - label:
+                              pad_bottom: 2
+                              text_font: font_tiny
+                              text_color: paper_black
+                              text: "°C"
+              - obj:
+                  x: 0
+                  y: 112
+                  width: 100%
+                  height: 34
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: END
+                    pad_column: 3
+                  widgets:
+                    - label:
+                        long_mode: CLIP
+                        text_font: font_small
+                        text_color: paper_black
+                        text: "Down"
+                    - obj:
+                        width: SIZE_CONTENT
+                        height: 100%
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: END
+                          pad_column: 3
+                        widgets:
+                          - label:
+                              id: lbl_downstairs_temp
+                              long_mode: CLIP
+                              text_font: font_small
+                              text_color: paper_black
+                              text: "--.-"
+                          - label:
+                              pad_bottom: 2
+                              text_font: font_tiny
+                              text_color: paper_black
+                              text: "°C"
 
-      // Temperatures overview schema
-      it.filled_rectangle(200, 0, 200, 160);
-      it.filled_rectangle(200, 3, 197, 154, COLOR_OFF);
-      it.line(200, 60, 400, 60);
+        # Notification feed. The electricity tariff is a permanent entry in the
+        # first slot, inverted while the tariff is normal; the remaining nine
+        # slots are filled with whatever needs attention and hidden otherwise.
+        - obj:
+            x: 400
+            y: 0
+            width: 400
+            height: 160
+            styles: panel_style
+            border_side: [TOP, BOTTOM, RIGHT]
+            scrollable: false
+            pad_all: 0
+            widgets:
+              - label:
+                  id: notification_1
+                  x: 3
+                  y: 2
+                  width: 196
+                  height: 28
+                  bg_color: paper_white
+                  bg_opa: COVER
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  text: ""
+              - label:
+                  id: notification_2
+                  x: 201
+                  y: 2
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_3
+                  x: 3
+                  y: 32
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_4
+                  x: 201
+                  y: 32
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_5
+                  x: 3
+                  y: 62
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_6
+                  x: 201
+                  y: 62
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_7
+                  x: 3
+                  y: 92
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_8
+                  x: 201
+                  y: 92
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_9
+                  x: 3
+                  y: 122
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
+              - label:
+                  id: notification_10
+                  x: 201
+                  y: 122
+                  width: 196
+                  height: 28
+                  pad_left: 2
+                  pad_right: 2
+                  text_font: font_notification
+                  text_color: paper_black
+                  long_mode: DOT
+                  hidden: true
+                  text: ""
 
-      // Temperature outside
-      if (weather_condition == "partlycloudy") {
-          weather_icon = "\U000F0595";
-      } else if (weather_condition == "cloudy") {
-          weather_icon = "\U000F0590";
-      } else if (weather_condition == "partlycloudy-fog") {
-          weather_icon = "\U000F0591";
-      } else if (weather_condition == "partlycloudy-light-rain") {
-          weather_icon = "\U000F0F33";
-      } else if (weather_condition == "partlycloudy-rain") {
-          weather_icon = "\U000F0F33";
-      } else if (weather_condition == "light-rain") {
-          weather_icon = "\U000F0F33";
-      } else if (weather_condition == "rainy") {
-          weather_icon = "\U000F0597";
-      } else if (weather_condition == "snowy-rainy") {
-          weather_icon = "\U000F067F";
-      } else if (weather_condition == "partlycloudy-light-snow") {
-          weather_icon = "\U000F0F35";
-      } else if (weather_condition == "partlycloudy-snow") {
-          weather_icon = "\U000F0F34";
-      } else if (weather_condition == "light-snow") {
-          weather_icon = "\U000F0598";
-      } else if (weather_condition == "snowy") {
-          weather_icon = "\U000F0F36";
-      } else if (weather_condition == "partlycloudy-lightning") {
-          weather_icon = "\U000F0F32";
-      } else if (weather_condition == "lightning") {
-          weather_icon = "\U000F0593";
-      } else if (weather_condition == "fog") {
-          weather_icon = "\U000F0591";
-      }
-      it.printf(202, 5, id(font_weather), "%s", weather_icon.c_str());
-      it.printf(250, 0, id(font_big), "%0.0f°C", id(outside_temperature).state);
+        # Today's calendar. Each of the four event slots stacks a time line on
+        # top of a summary line; the time line is hidden for all-day events so
+        # the slot shrinks to a single row. Slots are filled by update_dashboard
+        # and hidden when unused, which lets flex collapse the empty space.
+        - obj:
+            x: 0
+            y: 160
+            width: 400
+            height: 320
+            styles: panel_style
+            border_side: [BOTTOM, LEFT, RIGHT]
+            scrollable: false
+            pad_all: 8
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              pad_row: 4
+            widgets:
+              - label:
+                  width: 100%
+                  text_align: CENTER
+                  text_font: font_header
+                  text_color: paper_black
+                  text: "TODAY"
+              - obj:
+                  width: 100%
+                  height: 2
+                  bg_color: paper_black
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+              # Timeline rows: a continuous rule runs down the left with a dot
+              # per event. Each row is a fixed height so consecutive rail
+              # segments join into one line; the row hides when unused.
+              - obj:
+                  id: cal_today_events
+                  width: 100%
+                  height: SIZE_CONTENT
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: COLUMN
+                    pad_row: 0
+                  widgets:
+                    - obj:
+                        id: cal_today_slot_1
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_today_rail_1
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_today_line_1
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_today_time_1
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_today_title_1
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: "Loading..."
+                    - obj:
+                        id: cal_today_slot_2
+                        hidden: true
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_today_rail_2
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_today_line_2
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_today_time_2
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_today_title_2
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: ""
+                    - obj:
+                        id: cal_today_slot_3
+                        hidden: true
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_today_rail_3
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_today_line_3
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_today_time_3
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_today_title_3
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: ""
+                    - obj:
+                        id: cal_today_slot_4
+                        hidden: true
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_today_rail_4
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_today_line_4
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_today_time_4
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_today_title_4
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: ""
+              # Shown instead of the timeline when a day has no events, so the
+              # placeholder sits centred in the space the events would fill.
+              - obj:
+                  id: cal_today_empty
+                  hidden: true
+                  flex_grow: 1
+                  width: 100%
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: COLUMN
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                    pad_row: 0
+                  widgets:
+                    - label:
+                        width: 100%
+                        text_align: CENTER
+                        text_font: font_small
+                        text_color: paper_black
+                        text: "Nothing planned"
 
-      // Display temperatures inside the house
-      it.printf(205, 75, id(font_big), "\U000F06A1");
-      it.printf(260, 75, id(font_small), "\U000F0FD2 %0.1f°C", id(bedroom_temperature).state);
-      it.printf(260, 110, id(font_small), "\U000F04B9 %0.1f°C", id(living_room_temperature).state);
-
-      // Energy tariff setup
-      it.filled_rectangle(400, 0, 200, 160);
-      it.filled_rectangle(400, 3, 197, 154, COLOR_OFF);
-      it.line(400, 42, 600, 42);
-      it.print(412, 2, id(font_small), "Electric tariff");
-
-      // Electric tariff formatting
-      if (display_tariff == "Normal") {
-          it.filled_rectangle(400, 42, 600, 160);
-          it.printf(402, 60, id(font_big), color_white, "Normal");
-      } else { 
-          it.printf(440, 60, id(font_big), "Low");
-      }
-
-      // Status rectangles
-      it.filled_rectangle(600, 0, 200, 160);
-      it.filled_rectangle(600, 3, 197, 154, COLOR_OFF);
-      // Lights on
-      it.printf(602, 3, id(font_small), "\U000F06E8");
-      it.printf(642, 3, id(font_small), "%0.0f", id(number_of_lights_on).state);
-      // Back door open
-      it.printf(602, 33, id(font_small), "\U000F081B");
-      if (id(back_door_open).state == "on") {
-          // Warning symbol when open
-          it.printf(642, 33, id(font_small), "\U000F0026");
-      } else {
-          // Everything is ok when it is closed
-          it.printf(642, 33, id(font_small), "\U000F05E1");
-      }
-      // Fan kelderisita de Rebeca on calendar family on screen (x: 12, y: 394019)
-      it.printf(602, 63, id(font_small), "\U000F0210");
-      if (id(fan_kelder).state == "on") {
-          it.printf(642, 63, id(font_small), "\U000F05E1");
-      } else {
-          it.printf(642, 63, id(font_small), "\U000F0766");
-      }
-      // Vacuum need cleaning
-      it.printf(602, 93, id(font_small), "\U000F070D");
-      if (id(vacuum_runs_without_cleaning).state > 1) {
-          it.printf(642, 93, id(font_small), "\U000F1238");
-      }
-      // Fountain needs cleaning
-      it.printf(602, 123, id(font_small), "\U000F096B");
-      if (id(water_fountain_must_be_cleaned).state == "on") {
-          // Warning symbol when it needs cleaning
-          it.printf(642, 123, id(font_small), "\U000F0026");
-      }
-
-      // Second column
-      // Dark mode
-      it.printf(710, 3, id(font_small), "\U000F059A");
-      if (id(is_dark).state == "on") {
-          it.printf(750, 3, id(font_small), "\U000F05E1");
-      } else {
-          it.printf(750, 3, id(font_small), "\U000F0766");
-      }
-      // Night mode
-      it.printf(710, 33, id(font_small), "\U000F0594");
-      if (id(is_night).state == "on") {
-          it.printf(750, 33, id(font_small), "\U000F05E1");
-      } else {
-          it.printf(750, 33, id(font_small), "\U000F0766");
-      }
-
-      // Todays calendar items
-      it.filled_rectangle(0, 160, 400, 160);
-      it.filled_rectangle(3, 160, 394, 157, COLOR_OFF);
-
-      // Tomorrows calendar items
-      it.filled_rectangle(400, 160, 400, 160);
-      it.filled_rectangle(400, 160, 397, 157, COLOR_OFF);
-
-      auto get_time_str = [](std::string datetime_string) -> std::string {
-          // Timed format: 2026-01-28T10:00:00+01:00
-          // The 'T' is at index 10. HH:MM starts at index 11.
-          if (datetime_string.length() > 11 && datetime_string[10] == 'T') {
-              return datetime_string.substr(11, 5);
-          }
-          return "All Day";
-      };
-
-      int x, y;
-      int today_y = 160;
-      int tomorrow_y = 160;
-      int line_height = 30;
-      for (const auto& event : global_events) {
-          std::string start_time_label = get_time_str(event.start);
-          std::string end_time_label = get_time_str(event.end);
-          if (end_time_label.c_str() == "All Day") {
-              end_time_label = "";
-          }
-
-          if (event.today) {
-              y = today_y;
-              today_y += line_height;
-              x = 12;
-          } else {
-              y = tomorrow_y;
-              tomorrow_y += line_height;
-              x = 412;
-          }
-
-          ESP_LOGD("calendar", "Printing event %s on calendar %s (from %s until %s) on screen (x: %d, y: %d)", event.summary.c_str(), event.cal_name.c_str(), start_time_label.c_str(), end_time_label.c_str(), x, y);
-          it.printf(x, y, id(font_small), "%s - %s: %s", start_time_label.c_str(), end_time_label.c_str(), event.summary.c_str());
-          //it.line(x - 12, y - 160, x - 12, y);
-      }
-
-      it.printf(5, 330, id(font_small), "Weather condition: %s", weather_condition.c_str());
+        # Tomorrow's calendar
+        - obj:
+            x: 400
+            y: 160
+            width: 400
+            height: 320
+            styles: panel_style
+            border_side: [BOTTOM, RIGHT]
+            scrollable: false
+            pad_all: 8
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              pad_row: 4
+            widgets:
+              - label:
+                  width: 100%
+                  text_align: CENTER
+                  text_font: font_header
+                  text_color: paper_black
+                  text: "TOMORROW"
+              - obj:
+                  width: 100%
+                  height: 2
+                  bg_color: paper_black
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+              # Timeline rows: a continuous rule runs down the left with a dot
+              # per event. Each row is a fixed height so consecutive rail
+              # segments join into one line; the row hides when unused.
+              - obj:
+                  id: cal_tomorrow_events
+                  width: 100%
+                  height: SIZE_CONTENT
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: COLUMN
+                    pad_row: 0
+                  widgets:
+                    - obj:
+                        id: cal_tomorrow_slot_1
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_tomorrow_rail_1
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_tomorrow_line_1
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_tomorrow_time_1
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_tomorrow_title_1
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: "Loading..."
+                    - obj:
+                        id: cal_tomorrow_slot_2
+                        hidden: true
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_tomorrow_rail_2
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_tomorrow_line_2
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_tomorrow_time_2
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_tomorrow_title_2
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: ""
+                    - obj:
+                        id: cal_tomorrow_slot_3
+                        hidden: true
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_tomorrow_rail_3
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_tomorrow_line_3
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_tomorrow_time_3
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_tomorrow_title_3
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: ""
+                    - obj:
+                        id: cal_tomorrow_slot_4
+                        hidden: true
+                        width: 100%
+                        height: 62
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: START
+                          pad_column: 10
+                        widgets:
+                          - obj:
+                              id: cal_tomorrow_rail_4
+                              width: 26
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              widgets:
+                                - obj:
+                                    id: cal_tomorrow_line_4
+                                    x: 12
+                                    y: 0
+                                    width: 2
+                                    height: 100%
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 0
+                                    pad_all: 0
+                                - obj:
+                                    x: 6
+                                    y: 6
+                                    width: 14
+                                    height: 14
+                                    bg_color: paper_black
+                                    bg_opa: COVER
+                                    border_width: 0
+                                    radius: 7
+                                    pad_all: 0
+                          - obj:
+                              flex_grow: 1
+                              height: 100%
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              scrollable: false
+                              layout:
+                                type: flex
+                                flex_flow: COLUMN
+                                pad_row: 0
+                              widgets:
+                                - label:
+                                    id: cal_tomorrow_time_4
+                                    text_font: font_header
+                                    text_color: paper_black
+                                    text: ""
+                                - label:
+                                    id: cal_tomorrow_title_4
+                                    width: 100%
+                                    height: 34
+                                    text_font: font_small
+                                    text_color: paper_black
+                                    long_mode: DOT
+                                    text: ""
+              # Shown instead of the timeline when a day has no events, so the
+              # placeholder sits centred in the space the events would fill.
+              - obj:
+                  id: cal_tomorrow_empty
+                  hidden: true
+                  flex_grow: 1
+                  width: 100%
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: COLUMN
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                    pad_row: 0
+                  widgets:
+                    - label:
+                        width: 100%
+                        text_align: CENTER
+                        text_font: font_small
+                        text_color: paper_black
+                        text: "Nothing planned"
