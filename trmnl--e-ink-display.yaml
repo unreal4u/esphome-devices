@@ -199,14 +199,15 @@ sensor:
           max_value: 100
     on_value:
       then:
-        # Only refresh the panel when the battery notification appears or clears
+        # The strip shows a whole percentage below 90%, so refresh when that
+        # number changes and when the slot appears or clears. -1 means hidden.
         - if:
             condition:
               lambda: |-
-                static bool was_shown = false;
-                bool is_shown = !isnan(x) && x <= 80.0f;
-                bool changed = is_shown != was_shown;
-                was_shown = is_shown;
+                static int last_shown = -1;
+                int shown = (!isnan(x) && x < 90.0f) ? (int) roundf(x) : -1;
+                bool changed = shown != last_shown;
+                last_shown = shown;
                 return changed;
             then:
               - script.execute: request_dashboard_update
@@ -364,6 +365,38 @@ script:
           snprintf(lights_text, sizeof(lights_text), "%d", lights_on);
           lv_label_set_text(id(perm_lights_status), lights_text);
 
+          // Battery only earns a permanent slot once it is worth acting on.
+          // The icon steps with the charge so the strip reads at a glance.
+          const float battery = id(battery_level).state;
+          if (!isnan(battery) && battery < 90.0f) {
+            const int pct = (int) roundf(battery);
+            const char *battery_icon = "\U000F0083";  // alert, under 20%
+            if (pct >= 80) {
+              battery_icon = "\U000F0081";
+            } else if (pct >= 70) {
+              battery_icon = "\U000F0080";
+            } else if (pct >= 60) {
+              battery_icon = "\U000F007F";
+            } else if (pct >= 50) {
+              battery_icon = "\U000F007E";
+            } else if (pct >= 40) {
+              battery_icon = "\U000F007D";
+            } else if (pct >= 30) {
+              battery_icon = "\U000F007C";
+            } else if (pct >= 20) {
+              battery_icon = "\U000F007B";
+            }
+            char battery_text[8];
+            snprintf(battery_text, sizeof(battery_text), "%d%%", pct);
+            lv_label_set_text(id(perm_battery_icon), battery_icon);
+            lv_label_set_text(id(perm_battery_status), battery_text);
+            lv_obj_remove_flag(id(perm_battery), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(id(perm_battery_rule), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(perm_battery), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(perm_battery_rule), LV_OBJ_FLAG_HIDDEN);
+          }
+
           lv_obj_t *notification_labels[8] = {
             id(notification_1), id(notification_2), id(notification_3),
             id(notification_4), id(notification_5), id(notification_6),
@@ -403,12 +436,6 @@ script:
           }
           if (id(f1_race_week).state == "on") {
             notifications[count++] = "\U000F07AC Rawe Ceek";
-          }
-          if (!isnan(id(battery_level).state) && id(battery_level).state <= 80.0f) {
-            char battery[32];
-            snprintf(battery, sizeof(battery), "\U000F0083 Battery %0.0f%%",
-                     id(battery_level).state);
-            notifications[count++] = battery;
           }
 
           for (int slot = 0; slot < 8; slot++) {
@@ -798,7 +825,6 @@ font:
           "\U000F0594", # mdi-weather-night
           "\U000F096B", # mdi-fountain
           "\U000F07AC", # mdi-car-sports, F1 race week
-          "\U000F0083", # mdi-battery-alert, low battery
         ]
   # Status value under the icon of a permanent notification. Only ever holds a
   # short word or a count, so it can be large enough to read across the room
@@ -807,7 +833,7 @@ font:
     id: font_status
     size: 24
     bpp: 1
-    glyphs: "Low€"
+    glyphs: "Low€0123456789%"
   # Only ever holds the count of lights that are on, so it carries digits alone
   # and can be sized purely for legibility across the room.
   - file: "gfonts://Inter@700"
@@ -815,15 +841,24 @@ font:
     size: 38
     bpp: 1
     glyphs: "0123456789"
-  # Pylon and bulb on the always-on strip. Larger than the feed icons, with the
-  # bold exclamation pulled in so a normal tariff can still invert as one badge.
+  # Icons on the always-on strip. The strip only ever stacks three of these, so
+  # they get far more room than the feed icons and are sized to read at a glance
+  # from across the room. The battery variants track the charge level.
   - file: "fonts/materialdesignicons-webfont.ttf"
     id: font_perm_icon
-    size: 40
+    size: 56
     bpp: 1
     glyphs: [
       "\U000F0D3E", # mdi-transmission-tower
       "\U000F06E8", # mdi-lightbulb-on
+      "\U000F0083", # mdi-battery-alert, below 20%
+      "\U000F007B", # mdi-battery-20
+      "\U000F007C", # mdi-battery-30
+      "\U000F007D", # mdi-battery-40
+      "\U000F007E", # mdi-battery-50
+      "\U000F007F", # mdi-battery-60
+      "\U000F0080", # mdi-battery-70
+      "\U000F0081", # mdi-battery-80
     ]
   # Start/end times of calendar events
   - file: "gfonts://Inter@400"
@@ -1357,12 +1392,16 @@ lvgl:
                   border_width: 0
                   radius: 0
                   pad_all: 0
+              # Always-on strip: tariff, then lights, then battery. Three equal
+              # 104px slots, so each icon gets the full width of the strip.
+              # Starts at 306 where the rule above ends, so the inverted tariff
+              # block butts straight onto it with no white sliver between.
               - obj:
                   id: perm_tariff
-                  x: 310
+                  x: 306
                   y: 4
-                  width: 84
-                  height: 76
+                  width: 90
+                  height: 104
                   bg_opa: TRANSP
                   border_width: 0
                   radius: 0
@@ -1374,7 +1413,7 @@ lvgl:
                         x: 0
                         y: 2
                         width: 100%
-                        height: 42
+                        height: 60
                         text_align: CENTER
                         bg_opa: TRANSP
                         radius: 0
@@ -1384,9 +1423,9 @@ lvgl:
                     - label:
                         id: perm_tariff_status
                         x: 0
-                        y: 44
+                        y: 66
                         width: 100%
-                        height: 30
+                        height: 36
                         text_align: CENTER
                         long_mode: CLIP
                         bg_opa: TRANSP
@@ -1395,10 +1434,10 @@ lvgl:
                         text: ""
               - obj:
                   id: perm_lights
-                  x: 310
-                  y: 86
-                  width: 84
-                  height: 90
+                  x: 306
+                  y: 108
+                  width: 90
+                  height: 104
                   bg_opa: TRANSP
                   border_width: 0
                   radius: 0
@@ -1410,7 +1449,7 @@ lvgl:
                         x: 0
                         y: 2
                         width: 100%
-                        height: 42
+                        height: 60
                         text_align: CENTER
                         text_font: font_perm_icon
                         text_color: paper_black
@@ -1418,12 +1457,76 @@ lvgl:
                     - label:
                         id: perm_lights_status
                         x: 0
-                        y: 42
+                        y: 62
                         width: 100%
-                        height: 46
+                        height: 42
                         text_align: CENTER
                         long_mode: CLIP
                         text_font: font_status_large
+                        text_color: paper_black
+                        text: ""
+              # Cell rules between the always-on items. Three stacked icons run
+              # together without them. Both start on the vertical rule so the
+              # junction is solid, and overshoot right so the panel border clips
+              # them flush.
+              - obj:
+                  x: 304
+                  y: 106
+                  width: 100
+                  height: 2
+                  bg_color: paper_black
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+              # Hidden together with the battery slot below it, otherwise a
+              # healthy battery leaves a rule with nothing under it.
+              - obj:
+                  id: perm_battery_rule
+                  x: 304
+                  y: 210
+                  width: 100
+                  height: 2
+                  hidden: true
+                  bg_color: paper_black
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+              # Hidden while the pack is above 90%, so a healthy battery does
+              # not permanently occupy the bottom of the strip.
+              - obj:
+                  id: perm_battery
+                  x: 306
+                  y: 212
+                  width: 90
+                  height: 104
+                  hidden: true
+                  bg_opa: TRANSP
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+                  scrollable: false
+                  widgets:
+                    - label:
+                        id: perm_battery_icon
+                        x: 0
+                        y: 2
+                        width: 100%
+                        height: 60
+                        text_align: CENTER
+                        text_font: font_perm_icon
+                        text_color: paper_black
+                        text: "\U000F0081"
+                    - label:
+                        id: perm_battery_status
+                        x: 0
+                        y: 66
+                        width: 100%
+                        height: 32
+                        text_align: CENTER
+                        long_mode: CLIP
+                        text_font: font_status
                         text_color: paper_black
                         text: ""
 
