@@ -62,6 +62,18 @@ text_sensor:
     id: active_tariff_sensor
     name: "Active Tariff"
     entity_id: sensor.p1_meter_dongle_current_tariff_parsed
+    # Home Assistant resends a state even when the value has not changed, and
+    # every resend executed the refresh script and reset its debounce. Let only
+    # a genuine change through, so the panel is not asked to redraw for news it
+    # already has.
+    filters: &only_on_change
+      - lambda: |-
+          static std::string last_value;
+          if (x == last_value) {
+            return {};
+          }
+          last_value = x;
+          return x;
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -76,6 +88,7 @@ text_sensor:
     entity_id: fan.kelder_controller_fan
     name: "Fan Kelder"
     id: fan_kelder
+    filters: *only_on_change
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -84,6 +97,7 @@ text_sensor:
     entity_id: binary_sensor.door_sensor_1_contact
     name: "Back door opened"
     id: back_door_open
+    filters: *only_on_change
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -92,6 +106,7 @@ text_sensor:
     entity_id: input_boolean.water_fountain_must_be_cleaned
     name: "Water fountain needs cleaning"
     id: water_fountain_must_be_cleaned
+    filters: *only_on_change
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -100,6 +115,7 @@ text_sensor:
     entity_id: input_boolean.dark_mode
     name: "Dark mode"
     id: is_dark
+    filters: *only_on_change
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -108,6 +124,7 @@ text_sensor:
     entity_id: input_boolean.night_mode
     name: "Night mode"
     id: is_night
+    filters: *only_on_change
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -116,6 +133,7 @@ text_sensor:
     entity_id: binary_sensor.f1_race_week
     name: "F1 race week"
     id: f1_race_week
+    filters: *only_on_change
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -137,6 +155,9 @@ sensor:
     entity_id: number.number_of_lights_on
     name: "Number of lights on"
     id: number_of_lights_on
+    # Drops identical republishes; see the text sensors above.
+    filters:
+      - delta: 0.001
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -144,6 +165,9 @@ sensor:
     entity_id: counter.vacuum_runs_without_cleaning
     name: "Vacuum runs without cleaning"
     id: vacuum_runs_without_cleaning
+    # Drops identical republishes; see the text sensors above.
+    filters:
+      - delta: 0.001
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -151,6 +175,9 @@ sensor:
     entity_id: sensor.k1c_ef19_progress
     name: "Printer progress"
     id: printer_progress
+    # Drops identical republishes; see the text sensors above.
+    filters:
+      - delta: 0.001
     on_value:
       then:
         - script.execute: request_dashboard_update
@@ -225,6 +252,20 @@ globals:
     restore_value: false
     initial_value: '-1'
 
+  # Fingerprint of what the panel is currently showing. Home Assistant
+  # republishes sensor states even when the value has not changed, so most
+  # redraws used to push a byte-identical screen at the cost of a five second
+  # refresh cycle. 0 means nothing has been drawn yet.
+  - id: dashboard_fingerprint
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: dashboard_needs_push
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+
 script:
   # Turn the divider on just long enough to take a stable ADC reading
   - id: sample_battery
@@ -237,11 +278,14 @@ script:
       - output.turn_off: battery_adc_enable
 
   # Coalesce related Home Assistant state changes into one e-paper refresh.
-  # Restart mode resets the short delay whenever another notification changes.
+  # Restart mode resets the delay whenever another notification changes. The
+  # wait is longer than it looks: at 500ms it expired while the panel was still
+  # mid-refresh, so a burst of sensor updates turned into back-to-back refreshes
+  # instead of one. Three seconds is still imperceptible next to a 5s refresh.
   - id: request_dashboard_update
     mode: restart
     then:
-      - delay: 500ms
+      - delay: 3s
       - script.execute: update_dashboard
 
   - id: update_dashboard
@@ -634,6 +678,69 @@ script:
             lv_obj_set_height(rail_lines[today_shown + tomorrow_shown - 1],
                               kRailDotCentre);
           }
+      # Decide whether this render is worth a refresh. Walking the widget tree
+      # rather than listing every label means a new widget cannot be forgotten
+      # here later. The clock is part of the fingerprint and changes every
+      # minute, so even if this missed something it could only go one minute
+      # stale before the next tick redraws anyway.
+      - lambda: |-
+          lv_obj_t *root = lv_obj_get_screen(id(lbl_time));
+          // Flex positions are only final once the layout has been recalculated,
+          // and the calendar moves its rows around, so settle it before reading
+          // any coordinates.
+          lv_obj_update_layout(root);
+
+          uint32_t hash = 2166136261u;  // FNV-1a
+          auto mix = [&hash](const void *data, size_t length) {
+            const uint8_t *bytes = (const uint8_t *) data;
+            for (size_t i = 0; i < length; i++) {
+              hash ^= bytes[i];
+              hash *= 16777619u;
+            }
+          };
+
+          std::vector<lv_obj_t *> pending;
+          pending.push_back(root);
+          while (!pending.empty()) {
+            lv_obj_t *obj = pending.back();
+            pending.pop_back();
+
+            const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+            mix(&hidden, sizeof(hidden));
+            // Anything inside a hidden widget is invisible, so changes in there
+            // must not count as a reason to refresh.
+            if (hidden) {
+              continue;
+            }
+
+            const int32_t x = lv_obj_get_x(obj);
+            const int32_t y = lv_obj_get_y(obj);
+            const int32_t w = lv_obj_get_width(obj);
+            const int32_t h = lv_obj_get_height(obj);
+            mix(&x, sizeof(x));
+            mix(&y, sizeof(y));
+            mix(&w, sizeof(w));
+            mix(&h, sizeof(h));
+
+            if (lv_obj_check_type(obj, &lv_label_class)) {
+              const char *text = lv_label_get_text(obj);
+              if (text != nullptr) {
+                mix(text, strlen(text));
+              }
+            }
+
+            const uint32_t children = lv_obj_get_child_count(obj);
+            for (uint32_t i = 0; i < children; i++) {
+              pending.push_back(lv_obj_get_child(obj, i));
+            }
+          }
+
+          if (hash == id(dashboard_fingerprint)) {
+            ESP_LOGD("dashboard", "Screen unchanged, skipping panel refresh");
+          } else {
+            id(dashboard_fingerprint) = hash;
+            id(dashboard_needs_push) = true;
+          }
 
 interval:
   - interval: 5min
@@ -683,6 +790,67 @@ interval:
                 char today_buffer[11];
                 strftime(today_buffer, sizeof(today_buffer), "%Y-%m-%d", &time_info);
                 std::string today_str(today_buffer);
+                const bool time_valid = now_time.is_valid();
+
+                // Home Assistant serialises each timestamp in whatever zone the
+                // source calendar produced: the local calendars come back as
+                // +02:00, but the F1 ICS is UTC. Everything downstream compares
+                // and slices these as plain strings against local time, so the
+                // offset is resolved once here rather than at every use.
+                auto days_from_civil = [](int y, unsigned m, unsigned d) -> long {
+                  y -= m <= 2;
+                  const long era = (y >= 0 ? y : y - 399) / 400;
+                  const unsigned yoe = (unsigned) (y - era * 400);
+                  const unsigned doy = (153u * (m + (m > 2 ? -3u : 9u)) + 2u) / 5u + d - 1u;
+                  const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+                  return era * 146097L + (long) doe - 719468L;
+                };
+                auto to_local_iso = [&](const std::string &value) -> std::string {
+                  // All-day events carry a bare date, which has no zone to convert.
+                  if (!time_valid || value.length() < 19 || value[10] != 'T') {
+                    return value;
+                  }
+                  int year, month, day, hour, minute, second;
+                  if (sscanf(value.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d",
+                             &year, &month, &day, &hour, &minute, &second) != 6) {
+                    return value;
+                  }
+                  const std::string tail = value.substr(19);
+                  long offset_seconds = 0;
+                  bool has_offset = false;
+                  if (!tail.empty() && (tail[0] == 'Z' || tail[0] == 'z')) {
+                    has_offset = true;
+                  } else {
+                    const size_t sign = tail.find_first_of("+-");
+                    if (sign != std::string::npos) {
+                      // Accepts both +02:00 and +0200.
+                      std::string digits;
+                      for (size_t i = sign + 1; i < tail.length() && digits.length() < 4; i++) {
+                        if (tail[i] >= '0' && tail[i] <= '9') {
+                          digits += tail[i];
+                        }
+                      }
+                      if (digits.length() >= 2) {
+                        const long oh = atol(digits.substr(0, 2).c_str());
+                        const long om = digits.length() >= 4 ? atol(digits.substr(2, 2).c_str()) : 0;
+                        offset_seconds = oh * 3600L + om * 60L;
+                        if (tail[sign] == '-') {
+                          offset_seconds = -offset_seconds;
+                        }
+                        has_offset = true;
+                      }
+                    }
+                  }
+                  // No offset at all means the value is already local wall time.
+                  if (!has_offset) {
+                    return value;
+                  }
+                  const long epoch_utc =
+                    days_from_civil(year, (unsigned) month, (unsigned) day) * 86400L +
+                    (long) hour * 3600L + (long) minute * 60L + (long) second - offset_seconds;
+                  return ESPTime::from_epoch_local((time_t) epoch_utc)
+                    .strftime("%Y-%m-%dT%H:%M:%S");
+                };
 
                 const char* calendars[] = {"calendar.family_calendar", "calendar.birthdays", "calendar.holidays_in_the_netherlands", "calendar.https_files_f1_motorsportcalendars_com_f1_calendar_p1_p2_p3_qualifying_sprint_gp_ics_t_1668761982125", "calendar.afvalkalendar_hoogeloon"};
                 auto ha_data = response["response"];
@@ -715,8 +883,8 @@ interval:
                             ESP_LOGI("calendar", "  + Calendar %s found with %d events", cal, events_count);
                             for (size_t event_number = 0; event_number < events_count; event_number++) {
                                 std::string summary = events[event_number]["summary"] | "No Summary";
-                                std::string start   = events[event_number]["start"]   | "Unknown Start";
-                                std::string end     = events[event_number]["end"]     | "Unknown End";
+                                std::string start   = to_local_iso(events[event_number]["start"] | "Unknown Start");
+                                std::string end     = to_local_iso(events[event_number]["end"]   | "Unknown End");
 
                                 if (start.substr(0, 10) == today_str) {
                                     today = true;
@@ -935,8 +1103,16 @@ lvgl:
   buffer_size: 25%
   color_depth: 16
   default_font: font_small
+  # LVGL redraws for all sorts of reasons; only push to the panel when the
+  # result differs from what is already on it. Each push blocks the loop for
+  # about five seconds and costs a refresh cycle of panel life.
   on_draw_end:
-    - component.update: epaper
+    - if:
+        condition:
+          lambda: 'return id(dashboard_needs_push);'
+        then:
+          - lambda: 'id(dashboard_needs_push) = false;'
+          - component.update: epaper
   style_definitions:
     # Panels sit edge to edge, so each one only draws the sides that are not
     # already drawn by its neighbour. That keeps every line on the screen a
