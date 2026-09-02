@@ -138,6 +138,56 @@ text_sensor:
       then:
         - script.execute: request_dashboard_update
 
+binary_sensor:
+  # Feeds the layout switch below: dashboard while someone is in the kitchen,
+  # full-screen clock when the room is empty. A real binary_sensor rather than
+  # a text_sensor purely so delayed_off is available, because mmWave presence
+  # drops out briefly when you stand still and every flip of the layout costs
+  # a multi-second panel refresh.
+  - platform: homeassistant
+    entity_id: binary_sensor.kitchen_assistant_esp32_s3_occupancy
+    name: "Kitchen occupancy"
+    id: kitchen_occupancy
+    filters:
+      - delayed_off: 60s
+    on_state:
+      then:
+        - lambda: |-
+            // Presence keeps ownership of the layout, so a manual override
+            // lasts until the room next changes state. Writing only when the
+            // switch disagrees stops an occupancy report that changed nothing
+            // from spending a refresh.
+            const bool want_clock = !x;
+            if (id(full_screen_clock).state != want_clock) {
+              if (want_clock) {
+                id(full_screen_clock).turn_on();
+              } else {
+                id(full_screen_clock).turn_off();
+              }
+            }
+
+switch:
+  # Which layout is on screen, as a handle Home Assistant can both read and
+  # write. Presence drives this by itself; it is exposed so the mode can be
+  # forced by hand or from an automation without reflashing.
+  - platform: template
+    name: "Full-screen clock"
+    id: full_screen_clock
+    optimistic: true
+    # The dashboard is the safe thing to boot into: presence corrects this
+    # within the minute either way, and a restart should never leave nothing
+    # but a clock on the wall.
+    restore_mode: ALWAYS_OFF
+    # Repaint immediately rather than through the coalescing script. That delay
+    # exists to absorb bursts of Home Assistant state changes, and a layout swap
+    # is not a burst: delayed_off on the occupancy sensor and the disagreement
+    # check above already make changes here rare, so waiting 3s only adds
+    # latency to the one change a person is standing there watching for.
+    on_turn_on:
+      - script.execute: update_dashboard
+    on_turn_off:
+      - script.execute: update_dashboard
+
 sensor:
   - platform: homeassistant
     id: outside_temperature
@@ -298,8 +348,33 @@ script:
       - lambda: |-
           auto now_time = id(local_time).now();
           id(last_rendered_minute) = now_time.is_valid() ? (int) now_time.minute : -1;
+      # Swap between the dashboard and the empty-room clock. The switch is the
+      # single source of truth: presence writes to it rather than being read
+      # here, so a manual override travels exactly the same path.
+      - lambda: |-
+          const bool occupied = !id(full_screen_clock).state;
+          lv_obj_t *panels[4] = {
+            id(panel_time), id(panel_weather), id(panel_notifications), id(panel_calendar),
+          };
+          for (lv_obj_t *panel : panels) {
+            if (occupied) {
+              lv_obj_remove_flag(panel, LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+          if (occupied) {
+            lv_obj_add_flag(id(clock_only_panel), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_remove_flag(id(clock_only_panel), LV_OBJ_FLAG_HIDDEN);
+          }
       - lvgl.label.update:
           id: lbl_time
+          text:
+            time_format: "%H:%M"
+            time: local_time
+      - lvgl.label.update:
+          id: lbl_clock_only
           text:
             time_format: "%H:%M"
             time: local_time
@@ -327,45 +402,54 @@ script:
             lv_obj_set_style_bg_color(day_cells[cell], is_today ? ink : paper, LV_PART_MAIN);
             lv_obj_set_style_text_color(day_cells[cell], is_today ? paper : ink, LV_PART_MAIN);
           }
-      - lvgl.label.update:
-          id: lbl_weather_icon
-          text: !lambda |-
-            std::string weather_condition = id(outside_weather).state;
-            // Cooldown and night mode both mean it is dark outside, so a clear
-            // sky has to read as a moon instead of a sun. The overcast
-            // conditions look the same either way and need no night variant.
-            bool after_dark =
-              id(is_night).state == "on" || id(is_dark).state == "on";
-            if (weather_condition == "partlycloudy") {
-              return after_dark ? "\U000F0F31" : "\U000F0595";
-            } else if (weather_condition == "cloudy") {
-              return "\U000F0590";
-            } else if (weather_condition == "partlycloudy-fog" || weather_condition == "fog") {
-              return "\U000F0591";
-            } else if (weather_condition == "partlycloudy-light-rain" ||
-                       weather_condition == "partlycloudy-rain" ||
-                       weather_condition == "light-rain") {
-              return "\U000F0F33";
-            } else if (weather_condition == "rainy") {
-              return "\U000F0597";
-            } else if (weather_condition == "snowy-rainy") {
-              return "\U000F067F";
-            } else if (weather_condition == "partlycloudy-light-snow") {
-              return "\U000F0F35";
-            } else if (weather_condition == "partlycloudy-snow") {
-              return "\U000F0F34";
-            } else if (weather_condition == "light-snow") {
-              return "\U000F0598";
-            } else if (weather_condition == "snowy") {
-              return "\U000F0F36";
-            } else if (weather_condition == "partlycloudy-lightning") {
-              return "\U000F0F32";
-            } else if (weather_condition == "lightning") {
-              return "\U000F0593";
-            }
-            return after_dark ? "\U000F0594" : "\U000F0599";
+      # One glyph feeds two labels: the dashboard's weather panel and the
+      # empty-room clock's status strip both show the current condition.
+      - lambda: |-
+          std::string weather_condition = id(outside_weather).state;
+          // Cooldown and night mode both mean it is dark outside, so a clear
+          // sky has to read as a moon instead of a sun. The overcast
+          // conditions look the same either way and need no night variant.
+          bool after_dark =
+            id(is_night).state == "on" || id(is_dark).state == "on";
+          const char *glyph;
+          if (weather_condition == "partlycloudy") {
+            glyph = after_dark ? "\U000F0F31" : "\U000F0595";
+          } else if (weather_condition == "cloudy") {
+            glyph = "\U000F0590";
+          } else if (weather_condition == "partlycloudy-fog" || weather_condition == "fog") {
+            glyph = "\U000F0591";
+          } else if (weather_condition == "partlycloudy-light-rain" ||
+                     weather_condition == "partlycloudy-rain" ||
+                     weather_condition == "light-rain") {
+            glyph = "\U000F0F33";
+          } else if (weather_condition == "rainy") {
+            glyph = "\U000F0597";
+          } else if (weather_condition == "snowy-rainy") {
+            glyph = "\U000F067F";
+          } else if (weather_condition == "partlycloudy-light-snow") {
+            glyph = "\U000F0F35";
+          } else if (weather_condition == "partlycloudy-snow") {
+            glyph = "\U000F0F34";
+          } else if (weather_condition == "light-snow") {
+            glyph = "\U000F0598";
+          } else if (weather_condition == "snowy") {
+            glyph = "\U000F0F36";
+          } else if (weather_condition == "partlycloudy-lightning") {
+            glyph = "\U000F0F32";
+          } else if (weather_condition == "lightning") {
+            glyph = "\U000F0593";
+          } else {
+            glyph = after_dark ? "\U000F0594" : "\U000F0599";
+          }
+          lv_label_set_text(id(lbl_weather_icon), glyph);
+          lv_label_set_text(id(lbl_clock_weather_icon), glyph);
       - lvgl.label.update:
           id: lbl_outside_temp
+          text:
+            format: "%0.0f"
+            args: ['id(outside_temperature).state']
+      - lvgl.label.update:
+          id: lbl_clock_outside_temp
           text:
             format: "%0.0f"
             args: ['id(outside_temperature).state']
@@ -403,11 +487,21 @@ script:
           lv_obj_set_style_bg_opa(id(perm_tariff_icon), LV_OPA_TRANSP, LV_PART_MAIN);
           lv_obj_set_style_text_color(id(perm_tariff_icon), ink, LV_PART_MAIN);
 
+          // The empty-room clock carries the same indicator, so it has to
+          // invert on the same condition; one meaning, not two.
+          lv_label_set_text(id(lbl_clock_tariff_status), low_tariff ? "Low" : "€€€");
+          lv_obj_set_style_bg_opa(id(lbl_clock_tariff_status),
+                                  low_tariff ? LV_OPA_TRANSP : LV_OPA_COVER, LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(lbl_clock_tariff_status), ink, LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(lbl_clock_tariff_status),
+                                      low_tariff ? ink : paper, LV_PART_MAIN);
+
           int lights_on = isnan(id(number_of_lights_on).state)
             ? 0 : (int) id(number_of_lights_on).state;
           char lights_text[8];
           snprintf(lights_text, sizeof(lights_text), "%d", lights_on);
           lv_label_set_text(id(perm_lights_status), lights_text);
+          lv_label_set_text(id(lbl_clock_lights_status), lights_text);
 
           // Battery only earns a permanent slot once it is worth acting on.
           // The icon steps with the charge so the strip reads at a glance.
@@ -1033,6 +1127,26 @@ font:
     id: font_tiny
     size: 20
     bpp: 1
+  # The empty-room clock. Sized to be read from well outside the presence
+  # detector's range, so it carries digits and the placeholder dashes only.
+  # Monospaced on purpose. Inter's digits are proportional -- at this size its
+  # "1" is 95px wide against 149px for "4" -- so a centred clock jumped by over
+  # 100px as the digits changed. Here every glyph is one fixed advance wide, so
+  # the clock cannot move. "+" for the spaces: ESPHome drops the family name
+  # straight into the Google Fonts URL.
+  - file: "gfonts://IBM+Plex+Mono@700"
+    id: font_clock_huge
+    size: 224
+    bpp: 1
+    glyphs: "0123456789:-"
+  # Values on the empty-room clock's status strip. Monospaced for the same
+  # reason, which also makes "Low" and "€€€" identical widths at 3 characters
+  # each, so the tariff chip never changes size. 33px per character at size 55.
+  - file: "gfonts://IBM+Plex+Mono@700"
+    id: font_clock_status
+    size: 55
+    bpp: 1
+    glyphs: "0123456789Low€-"
   - file: "fonts/materialdesignicons-webfont.ttf"
     id: font_weather
     size: 48
@@ -1136,6 +1250,7 @@ lvgl:
         # full width of the panel and let its cell borders line up with the
         # panel borders instead of floating inside them.
         - obj:
+            id: panel_time
             x: 0
             y: 0
             width: 200
@@ -1287,6 +1402,7 @@ lvgl:
         # so the small degree suffix follows the number whatever its width, and
         # the pad_bottom values lift each suffix onto the number's baseline.
         - obj:
+            id: panel_weather
             x: 200
             y: 0
             width: 200
@@ -1434,6 +1550,7 @@ lvgl:
         # Notification feed. Worded alerts fill the left column; tariff and
         # lights stay in the narrow right-hand strip as an icon over their value.
         - obj:
+            id: panel_notifications
             x: 0
             y: 160
             width: 400
@@ -1709,6 +1826,7 @@ lvgl:
         # Calendar. The right panel is one chronological agenda: remaining
         # events for today first, followed by tomorrow's events.
         - obj:
+            id: panel_calendar
             x: 400
             y: 0
             width: 400
@@ -2331,3 +2449,171 @@ lvgl:
                         text_font: font_small
                         text_color: paper_black
                         text: "Nothing planned"
+
+        # Empty-room view: a full-screen clock covering the dashboard, so the
+        # time stays readable from well outside the kitchen's detection zone.
+        # Declared last so it draws above the four panels. The panels are hidden
+        # alongside it rather than merely covered, both to save LVGL the work and
+        # because the refresh fingerprint skips hidden subtrees: a notification
+        # changing behind this cover must not spend a panel refresh.
+        - obj:
+            id: clock_only_panel
+            hidden: true
+            x: 0
+            y: 0
+            width: 800
+            height: 480
+            bg_color: paper_white
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label:
+                  id: lbl_clock_only
+                  align: TOP_MID
+                  y: 26
+                  width: 100%
+                  text_align: CENTER
+                  text_font: font_clock_huge
+                  text_color: paper_black
+                  text: "--:--"
+              # Same edge-to-edge 2px divider the dashboard panels use, so both
+              # views share one visual language.
+              - obj:
+                  x: 0
+                  y: 332
+                  width: 800
+                  height: 2
+                  bg_color: paper_black
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+              # The three values still worth reading from across the room. Each
+              # icon and its value sit in their own box so the row spaces the
+              # three pairs evenly rather than the six widgets individually.
+              - obj:
+                  id: clock_only_status
+                  x: 0
+                  y: 352
+                  width: 800
+                  height: 112
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  # Three equal thirds rather than spacing the content evenly.
+                  # Content-sized slots meant one light switching on reflowed
+                  # the whole row; a fixed third keeps each group put no matter
+                  # what its neighbours do. The values inside are fixed width
+                  # too, sized to their widest reading, so nothing shifts at all.
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    flex_align_cross: CENTER
+                  widgets:
+                    # Outside temperature, laid out like the dashboard's weather
+                    # panel: bottom-aligned so the small degree suffix lands on
+                    # the number's baseline. Right-aligned in its box so the
+                    # suffix stays put whether it reads "9", "21" or "-12".
+                    - obj:
+                        flex_grow: 1
+                        height: SIZE_CONTENT
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_main: CENTER
+                          flex_align_cross: END
+                          pad_column: 6
+                        widgets:
+                          - label:
+                              id: lbl_clock_weather_icon
+                              pad_bottom: 10
+                              text_font: font_weather
+                              text_color: paper_black
+                              text: "\U000F0599"
+                          - label:
+                              id: lbl_clock_outside_temp
+                              width: 102
+                              text_align: RIGHT
+                              long_mode: CLIP
+                              text_font: font_clock_status
+                              text_color: paper_black
+                              text: "--"
+                          - label:
+                              pad_bottom: 8
+                              text_font: font_small
+                              text_color: paper_black
+                              text: "°C"
+                    # Electricity tariff. Icon and value are close enough in
+                    # size to centre against each other, which avoids guessing
+                    # at a baseline offset for the MDI glyph. Width is the 99px
+                    # of three monospaced characters plus the 16px of padding
+                    # that gives the inverted chip its breathing room.
+                    - obj:
+                        flex_grow: 1
+                        height: SIZE_CONTENT
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_main: CENTER
+                          flex_align_cross: CENTER
+                          pad_column: 10
+                        widgets:
+                          - label:
+                              id: lbl_clock_tariff_icon
+                              text_font: font_perm_icon
+                              text_color: paper_black
+                              text: "\U000F0D3E"
+                          - label:
+                              id: lbl_clock_tariff_status
+                              width: 118
+                              text_align: CENTER
+                              long_mode: CLIP
+                              pad_top: 2
+                              pad_bottom: 2
+                              pad_left: 8
+                              pad_right: 8
+                              bg_opa: TRANSP
+                              text_font: font_clock_status
+                              text_color: paper_black
+                              text: ""
+                    # Left-aligned: the count grows rightwards away from its
+                    # icon, so going from 9 to 10 lights leaves both put.
+                    - obj:
+                        flex_grow: 1
+                        height: SIZE_CONTENT
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_main: CENTER
+                          flex_align_cross: CENTER
+                          pad_column: 10
+                        widgets:
+                          - label:
+                              id: lbl_clock_lights_icon
+                              text_font: font_perm_icon
+                              text_color: paper_black
+                              text: "\U000F06E8"
+                          - label:
+                              id: lbl_clock_lights_status
+                              width: 70
+                              text_align: LEFT
+                              long_mode: CLIP
+                              text_font: font_clock_status
+                              text_color: paper_black
+                              text: "0"
