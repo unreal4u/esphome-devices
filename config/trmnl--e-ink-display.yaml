@@ -670,14 +670,26 @@ script:
             }
           };
 
+          // Counted separately from today_count, which insert_event caps at the
+          // number of display slots. The clock reports what is actually left of
+          // today, including anything the panel had no room to draw.
+          int today_remaining = 0;
           for (const auto &event : global_events) {
             if (occurs_on(event, today_date) && !timed_event_has_ended(event)) {
+              today_remaining++;
               insert_event(&event, today_events, today_count);
             }
             if (occurs_on(event, tomorrow_date)) {
               insert_event(&event, tomorrow_events, tomorrow_count);
             }
           }
+
+          // Sized for the widest thing "%d" of an int can produce, not for the
+          // one or two digits actually expected: the compiler cannot prove the
+          // counter's range and warns on anything smaller.
+          char remaining_text[12];
+          snprintf(remaining_text, sizeof(remaining_text), "%d", today_remaining);
+          lv_label_set_text(id(lbl_clock_events_status), remaining_text);
 
           int today_shown = today_count;
           int tomorrow_shown = tomorrow_count;
@@ -1113,6 +1125,7 @@ font:
     glyphs: [
       "\U000F0D3E", # mdi-transmission-tower
       "\U000F06E8", # mdi-lightbulb-on
+      "\U000F00ED", # mdi-calendar, today's remaining events
       "\U000F0083", # mdi-battery-alert, below 20%
       "\U000F007B", # mdi-battery-20
       "\U000F007C", # mdi-battery-30
@@ -2504,14 +2517,15 @@ lvgl:
                   border_width: 0
                   pad_all: 0
                   scrollable: false
-                  # Three equal thirds rather than spacing the content evenly.
-                  # Content-sized slots meant one light switching on reflowed
-                  # the whole row; a fixed third keeps each group put no matter
-                  # what its neighbours do. The values inside are fixed width
-                  # too, sized to their widest reading, so nothing shifts at all.
+                  # Every value in this row is a fixed-width label sized to its
+                  # widest reading, so each group's width never changes and
+                  # SPACE_EVENLY drops them in the same place forever. That is
+                  # what stops the row reflowing: with content-sized values, one
+                  # light switching on used to nudge all the groups sideways.
                   layout:
                     type: flex
                     flex_flow: ROW
+                    flex_align_main: SPACE_EVENLY
                     flex_align_cross: CENTER
                   widgets:
                     # Outside temperature, laid out like the dashboard's weather
@@ -2519,7 +2533,7 @@ lvgl:
                     # the number's baseline. Right-aligned in its box so the
                     # suffix stays put whether it reads "9", "21" or "-12".
                     - obj:
-                        flex_grow: 1
+                        width: SIZE_CONTENT
                         height: SIZE_CONTENT
                         bg_opa: TRANSP
                         border_width: 0
@@ -2528,7 +2542,6 @@ lvgl:
                         layout:
                           type: flex
                           flex_flow: ROW
-                          flex_align_main: CENTER
                           flex_align_cross: END
                           pad_column: 6
                         widgets:
@@ -2557,7 +2570,7 @@ lvgl:
                     # of three monospaced characters plus the 16px of padding
                     # that gives the inverted chip its breathing room.
                     - obj:
-                        flex_grow: 1
+                        width: SIZE_CONTENT
                         height: SIZE_CONTENT
                         bg_opa: TRANSP
                         border_width: 0
@@ -2566,7 +2579,6 @@ lvgl:
                         layout:
                           type: flex
                           flex_flow: ROW
-                          flex_align_main: CENTER
                           flex_align_cross: CENTER
                           pad_column: 10
                         widgets:
@@ -2591,7 +2603,7 @@ lvgl:
                     # Left-aligned: the count grows rightwards away from its
                     # icon, so going from 9 to 10 lights leaves both put.
                     - obj:
-                        flex_grow: 1
+                        width: SIZE_CONTENT
                         height: SIZE_CONTENT
                         bg_opa: TRANSP
                         border_width: 0
@@ -2600,7 +2612,6 @@ lvgl:
                         layout:
                           type: flex
                           flex_flow: ROW
-                          flex_align_main: CENTER
                           flex_align_cross: CENTER
                           pad_column: 10
                         widgets:
@@ -2611,6 +2622,34 @@ lvgl:
                               text: "\U000F06E8"
                           - label:
                               id: lbl_clock_lights_status
+                              width: 70
+                              text_align: LEFT
+                              long_mode: CLIP
+                              text_font: font_clock_status
+                              text_color: paper_black
+                              text: "0"
+                    # How much of today is still ahead of you. Counted with the
+                    # calendar panel's own rule so the two can never disagree.
+                    - obj:
+                        width: SIZE_CONTENT
+                        height: SIZE_CONTENT
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        layout:
+                          type: flex
+                          flex_flow: ROW
+                          flex_align_cross: CENTER
+                          pad_column: 10
+                        widgets:
+                          - label:
+                              id: lbl_clock_events_icon
+                              text_font: font_perm_icon
+                              text_color: paper_black
+                              text: "\U000F00ED"
+                          - label:
+                              id: lbl_clock_events_status
                               width: 70
                               text_align: LEFT
                               long_mode: CLIP

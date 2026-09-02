@@ -1,0 +1,541 @@
+substitutions:
+  device_name: kelder-controller
+  device_friendly_name: Kelder controller
+  device_comment: Controls devices in the basement
+
+packages:
+  basics: !include .basics.yaml
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: arduino
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_kelder_controller
+
+ota:
+  - platform: esphome
+    password: !secret otapwd_kelder_controller
+
+globals: 
+    # Whether fan is allowed to be turned on (max. 75% of the time in an hour time)
+  - id: timer_fan_operation
+    type: unsigned int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: fan_maximum_on_time
+    type: unsigned int
+    restore_value: yes
+    initial_value: '2700'
+
+    # Give a tiny bit less than 15 minutes of cooldown time because the cron runs every 1 hour
+  - id: fan_minimum_cooldown_time
+    type: unsigned int
+    restore_value: yes
+    initial_value: '890'
+
+  - id: fan_is_in_forced_cooldown
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+    # Rolling record of fan run time, one slot per minute. This caps the hourly
+    # total at fan_maximum_on_time regardless of how the run time is spread out,
+    # which the continuous-run counter above cannot do on its own.
+    # 61 slots, not 60: a slot is only cleared once the ring advances onto it, so
+    # 60 would span as little as 3541s and let ~30s/hour leak past the cap.
+    # Deliberately not restored: rewriting this every second would wear the flash
+    # out, and timer_fan_operation already survives a reboot.
+  - id: duty_ring
+    type: uint16_t[61]
+    restore_value: no
+
+  - id: duty_ring_slot
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: duty_ring_slot_seconds
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+
+    # Seconds the fan has run within the last hour, recomputed every second.
+  - id: duty_used_seconds
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+    # MQ-9 analog baseline in volts, learned in clean air after warmup.
+    # Not restored: a reboot should re-learn after the heater has settled.
+  - id: mq9_baseline
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+
+  - id: mq9_warm_samples
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+
+# Since we have a menu timer, this interval runs in an eternal loop every second and executes stuff if we are navigating through the menu
+interval:
+  - interval: 1sec
+    then:
+      - lambda: |-
+          // Book this second against the rolling hour before deciding anything,
+          // so every check below sees an up to date budget.
+          if (id(device_fan).state) {
+            id(duty_ring)[id(duty_ring_slot)]++;
+          }
+          id(duty_ring_slot_seconds)++;
+          if (id(duty_ring_slot_seconds) >= 60) {
+            id(duty_ring_slot_seconds) = 0;
+            id(duty_ring_slot) = (id(duty_ring_slot) + 1) % 61;
+            // Advancing onto the slot drops the oldest minute out of the window.
+            id(duty_ring)[id(duty_ring_slot)] = 0;
+          }
+          uint32_t duty_used = 0;
+          for (uint8_t i = 0; i < 61; i++) {
+            duty_used += id(duty_ring)[i];
+          }
+          id(duty_used_seconds) = duty_used;
+
+          if (id(device_fan).state) {
+            // Fan is turned on
+            id(timer_fan_operation)++;
+            if (id(timer_fan_operation) >= id(fan_maximum_on_time)) {
+              ESP_LOGD("interval-timer", "Forcing fan OFF due to maximum operation time");
+              auto call = id(device_fan).turn_off();
+              call.perform();
+              id(fan_is_in_forced_cooldown) = true;
+            } else if (duty_used >= id(fan_maximum_on_time)) {
+              // Hourly budget spent. No cooldown flag here: the budget gate keeps
+              // the fan off by itself, and it frees up gradually as slots expire
+              // rather than all at once like the rest period does.
+              ESP_LOGI("interval-timer", "Forcing fan OFF: hourly budget of %us is spent", id(fan_maximum_on_time));
+              auto call = id(device_fan).turn_off();
+              call.perform();
+            }
+          } else if (id(fan_is_in_forced_cooldown)) {
+            // Serving the mandatory rest period. Only once it is fully served
+            // does the fan get its full run time back. Counting this down only
+            // while the flag is set matters: a fan that switched off early on
+            // its own must not be handed a fresh 45 minutes after a few
+            // seconds just because the counter happened to pass this value.
+            if (id(timer_fan_operation) > 0) {
+              id(timer_fan_operation)--;
+            }
+            if (id(timer_fan_operation) <= (id(fan_maximum_on_time) - id(fan_minimum_cooldown_time))) {
+              ESP_LOGD("interval-timer", "Cooldown served, fan may run again");
+              id(timer_fan_operation) = 0;
+              id(fan_is_in_forced_cooldown) = false;
+            }
+          } else if (id(timer_fan_operation) > 0) {
+            // Switched off before hitting the limit, so let the accumulated run
+            // time decay second per second instead of clearing it outright.
+            id(timer_fan_operation)--;
+          }
+
+  - interval: 60s
+    then:
+      - script.execute: evaluate_kelder_fan
+
+output:
+  - platform: gpio
+    pin:
+      number: 26
+      inverted: True
+    id: light_relay
+  - platform: gpio
+    pin:
+      number: 27
+      inverted: True
+    id: fan_relay
+
+binary_sensor:
+# Reports when the reed switch from GPIO14 to GND is sensing a magnet and the door is closed.
+- platform: gpio
+  pin:
+    number: GPIO14
+    mode: INPUT_PULLUP
+    inverted: False
+  name: Door opened
+  device_class: door
+  filters:
+    - delayed_on: 100ms
+    - delayed_off: 500ms
+  on_press:
+    then:
+      - light.turn_on: device_light
+  on_release:
+    then:
+      - light.turn_off: device_light
+
+- platform: template
+  name: "Fan cooldown"
+  id: fan_active
+  device_class: lock
+  lambda: |-
+    return !id(fan_is_in_forced_cooldown) == true;
+
+# MQ-9 is a combustible-gas / CO sensor. The Flying-Fish board holds the heater
+# at 5 V, which is the methane/LPG mode (we are not cycling 1.4 V for CO).
+# Analog AO is on GPIO32. Keep AO at or below 3.3 V: clean air is typically
+# 0.3–1.5 V; if it sits near 3.1 V in fresh air, add a resistor divider.
+# This is not a certified gas alarm.
+- platform: template
+  name: "Gas sensor ready"
+  id: mq9_ready
+  entity_category: diagnostic
+  lambda: |-
+    return id(mq9_warm_samples) >= 105 && !isnan(id(mq9_baseline));
+
+- platform: template
+  name: "Gas leak"
+  id: mq9_leak
+  device_class: gas
+  icon: mdi:gas-cylinder
+  lambda: |-
+    if (id(mq9_warm_samples) < 105 || isnan(id(mq9_baseline)) || isnan(id(mq9_raw).state)) {
+      return false;
+    }
+    const float v = id(mq9_raw).state;
+    const float b = id(mq9_baseline);
+    if (b < 0.05f) {
+      return false;
+    }
+    return (v >= b * id(mq9_leak_ratio).state) || (v >= b + id(mq9_leak_delta).state);
+  filters:
+    - delayed_on: 5s
+    - delayed_off: 20s
+  on_press:
+    then:
+      - logger.log:
+          level: WARN
+          format: "MQ-9 gas leak trip: %.3f V (baseline %.3f V)"
+          args: [ 'id(mq9_raw).state', 'id(mq9_baseline)' ]
+
+fan:
+  - platform: binary
+    id: device_fan
+    name: "Fan"
+    output: fan_relay
+    on_turn_on:
+      then:
+        - lambda: |-
+            // Last line of defence, so a manual switch from HA cannot run the
+            // fan past what it is rated for either.
+            if (id(fan_is_in_forced_cooldown) == true) {
+              ESP_LOGD("fan-relay", "Forcing fan OFF on_turn_on due to minimum time");
+              auto call = id(device_fan).turn_off();
+              call.perform();
+            } else if (id(duty_used_seconds) >= id(fan_maximum_on_time)) {
+              ESP_LOGW("fan-relay", "Refusing to run: %us of the hourly %us budget already used",
+                       id(duty_used_seconds), id(fan_maximum_on_time));
+              auto call = id(device_fan).turn_off();
+              call.perform();
+            }
+
+# Exhausts kelder air to the street so drier living-room air can replace it.
+# HA used to turn the fan on once an hour whenever kelder dew point was above
+# the living-room helper, with no off path — that is why it ran all year.
+script:
+  - id: evaluate_kelder_fan
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(fan_auto_humidity).state) {
+            return;
+          }
+
+          const float kelder_t = id(temperature_reading).state;
+          const float kelder_h = id(humidity_reading).state;
+          const float living_t = id(living_temperature).state;
+          const float living_h = id(living_humidity).state;
+          if (isnan(kelder_t) || isnan(kelder_h) || isnan(living_t) || isnan(living_h)) {
+            ESP_LOGD("kelder-fan", "Skipping: waiting for kelder and living-room climate");
+            return;
+          }
+
+          // Same approximation HA used, so the two rooms stay comparable.
+          // Td = T - ((100 - RH) / 5); only trustworthy above ~50% RH.
+          const float kelder_td = kelder_t - ((100.0f - kelder_h) / 5.0f);
+          const float living_td = living_t - ((100.0f - living_h) / 5.0f);
+          const float on_margin = id(fan_on_margin).state;
+          const float off_margin = id(fan_off_margin).state;
+          const float delta = kelder_td - living_td;
+
+          ESP_LOGD("kelder-fan",
+                   "Kelder Td=%.1f living Td=%.1f delta=%.1f outside Td=%.1f (on>+%.1f off<=+%.1f) cooldown=%s fan=%s budget=%u/%us",
+                   kelder_td, living_td, delta, id(outside_dew_point).state, on_margin, off_margin,
+                   id(fan_is_in_forced_cooldown) ? "yes" : "no",
+                   id(device_fan).state ? "on" : "off",
+                   id(duty_used_seconds), id(fan_maximum_on_time));
+
+          if (id(fan_is_in_forced_cooldown)) {
+            return;
+          }
+
+          if (delta > on_margin) {
+            if (id(duty_used_seconds) >= id(fan_maximum_on_time)) {
+              ESP_LOGD("kelder-fan", "Kelder is %.1f °C wetter but the hourly budget is spent", delta);
+              return;
+            }
+            if (!id(device_fan).state) {
+              ESP_LOGI("kelder-fan", "Turning fan ON: kelder is %.1f °C wetter than living room", delta);
+              auto call = id(device_fan).turn_on();
+              call.perform();
+            }
+          } else if (delta <= off_margin) {
+            if (id(device_fan).state) {
+              ESP_LOGI("kelder-fan", "Turning fan OFF: kelder is no longer wetter than living room (delta=%.1f)", delta);
+              auto call = id(device_fan).turn_off();
+              call.perform();
+            }
+          }
+
+light:
+  - platform: binary
+    id: device_light
+    name: "Lamp"
+    output: light_relay
+
+switch:
+  - platform: template
+    name: "Fan auto humidity"
+    id: fan_auto_humidity
+    icon: mdi:fan-auto
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:
+      - script.execute: evaluate_kelder_fan
+    turn_off_action:
+      - logger.log: "Automatic kelder fan control disabled"
+
+number:
+  - platform: template
+    name: "Fan on margin"
+    id: fan_on_margin
+    icon: mdi:arrow-expand-up
+    unit_of_measurement: "°C"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    min_value: 0.2
+    max_value: 5.0
+    step: 0.1
+    mode: box
+  - platform: template
+    name: "Fan off margin"
+    id: fan_off_margin
+    icon: mdi:arrow-collapse-down
+    unit_of_measurement: "°C"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0.3
+    min_value: 0.0
+    max_value: 2.0
+    step: 0.1
+    mode: box
+  - platform: template
+    name: "Gas leak ratio"
+    id: mq9_leak_ratio
+    icon: mdi:chart-bell-curve
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 1.8
+    min_value: 1.2
+    max_value: 4.0
+    step: 0.1
+    mode: box
+  - platform: template
+    name: "Gas leak delta"
+    id: mq9_leak_delta
+    icon: mdi:plus-minus
+    unit_of_measurement: "V"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0.40
+    min_value: 0.15
+    max_value: 2.0
+    step: 0.05
+    mode: box
+
+sensor:
+  - platform: dht
+    model: AM2302
+    pin: 25
+    temperature:
+      id: temperature_reading
+      name: "Temperature"
+      on_value:
+        then:
+          lambda: |-
+            ESP_LOGD("dht-sensor", "Temperature changed to %0.02f", x);
+            id(evaluate_kelder_fan).execute();
+    humidity:
+      id: humidity_reading
+      name: "Humidity"
+      on_value:
+        then:
+          lambda: |-
+            ESP_LOGD("dht-sensor", "Humidity changed to %0.02f", x);
+            id(evaluate_kelder_fan).execute();
+    update_interval: 30s
+
+  - platform: homeassistant
+    entity_id: sensor.binary_clock_temperature
+    id: living_temperature
+    internal: true
+    on_value:
+      then:
+        - script.execute: evaluate_kelder_fan
+
+  - platform: homeassistant
+    entity_id: sensor.binary_clock_humidity
+    id: living_humidity
+    internal: true
+    on_value:
+      then:
+        - script.execute: evaluate_kelder_fan
+
+  - platform: homeassistant
+    entity_id: weather.home
+    attribute: dew_point
+    id: outside_dew_point
+    name: "Outside dew point"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Living room dew point"
+    unit_of_measurement: °C
+    device_class: temperature
+    update_interval: 30s
+    filters:
+      - round: 1
+    lambda: |-
+      if (isnan(id(living_temperature).state) || isnan(id(living_humidity).state)) {
+        return NAN;
+      }
+      return id(living_temperature).state - ((100.0f - id(living_humidity).state) / 5.0f);
+
+  - platform: template
+    name: "Fan timer"
+    unit_of_measurement: seconds
+    update_interval: 1s
+    device_class: duration
+    lambda: |-
+      return id(timer_fan_operation);
+
+  - platform: template
+    name: "Fan hourly budget used"
+    unit_of_measurement: seconds
+    update_interval: 30s
+    device_class: duration
+    lambda: |-
+      return id(duty_used_seconds);
+
+  - platform: template
+    name: "Fan duty cycle"
+    unit_of_measurement: "%"
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      return id(duty_used_seconds) / 36.0f;
+
+  - platform: template
+    name: "Dew point"
+    unit_of_measurement: °C
+    device_class: temperature
+    update_interval: 30s
+    filters:
+      - round: 1 # will round to 1 decimal place
+    lambda: |-
+      // Td = T - ((100 - RH)/5)
+      // Where Td is dew point temperature (in degrees Celsius), T is observed temperature (in degrees Celsius), 
+      // and RH is relative humidity (in percent). Apparently this relationship is fairly accurate for relative humidity values above 50%. 
+      return id(temperature_reading).state - ((100.0f - id(humidity_reading).state) / 5.0f);
+
+  - platform: adc
+    pin: GPIO32
+    id: mq9_raw
+    name: "Gas sensor"
+    icon: mdi:molecule
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    attenuation: 12db
+    samples: 16
+    sampling_mode: avg
+    update_interval: 2s
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+    on_value:
+      then:
+        - lambda: |-
+            // 90 samples at 2 s = 3 min heater warmup, then 15 samples to
+            // average a clean-air baseline. After that, a very slow EMA tracks
+            // drift without swallowing an actual leak.
+            if (id(mq9_warm_samples) < 90) {
+              id(mq9_warm_samples)++;
+              return;
+            }
+            if (id(mq9_warm_samples) < 105) {
+              id(mq9_warm_samples)++;
+              if (isnan(id(mq9_baseline))) {
+                id(mq9_baseline) = x;
+              } else {
+                const uint16_t n = id(mq9_warm_samples) - 90;
+                id(mq9_baseline) += (x - id(mq9_baseline)) / n;
+              }
+              if (id(mq9_warm_samples) == 105) {
+                ESP_LOGI("mq9", "Warmup done, clean-air baseline %.3f V", id(mq9_baseline));
+              }
+              return;
+            }
+            const bool would_alarm =
+                (x >= id(mq9_baseline) * id(mq9_leak_ratio).state) ||
+                (x >= id(mq9_baseline) + id(mq9_leak_delta).state);
+            if (would_alarm || id(mq9_leak).state) {
+              return;
+            }
+            id(mq9_baseline) = 0.996f * id(mq9_baseline) + 0.004f * x;
+
+  - platform: template
+    name: "Gas sensor baseline"
+    id: mq9_baseline_sensor
+    icon: mdi:minus
+    unit_of_measurement: V
+    device_class: voltage
+    entity_category: diagnostic
+    accuracy_decimals: 3
+    update_interval: 10s
+    lambda: |-
+      return id(mq9_baseline);
+
+  - platform: template
+    name: "Gas sensor index"
+    id: mq9_index
+    icon: mdi:gauge
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (isnan(id(mq9_baseline)) || isnan(id(mq9_raw).state) || id(mq9_baseline) < 0.05f) {
+        return NAN;
+      }
+      return id(mq9_raw).state / id(mq9_baseline);

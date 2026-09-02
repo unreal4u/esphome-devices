@@ -14,6 +14,13 @@ esp32:
   board: nodemcu-32s
   framework:
     type: arduino
+    advanced:
+      # This board reports rev 3.1, so the workaround code ESP-IDF carries for
+      # the older silicon bugs can be left out of the build. Note this is a
+      # floor, not a hint: the firmware will refuse to boot on any ESP32 older
+      # than 3.1, so drop it back to "3.0" before moving this config to
+      # another board.
+      minimum_chip_revision: "3.1"
 
 # Enable Home Assistant API
 api:
@@ -109,6 +116,13 @@ globals:
     restore_value: no
     initial_value: 'true'
 
+  # Which LVGL page is on screen. The refresh runs every second, so without this
+  # it would reload the same page over and over and force a needless full redraw.
+  - id: oled_menu_visible
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
 # Since we have a menu timer, this interval runs in an eternal loop every second and executes stuff if we are navigating through the menu
 interval:
   - interval: 1sec
@@ -140,25 +154,7 @@ interval:
               id(menu_selected_page) = 0;
             }
           }
-      # TODO I hate the following piece of code. Find out a way to generically solve this mess
-      - display.page.show: !lambda |-
-          if (id(menu_selected_page) == 1) {
-            return id(menu_selected_1);
-          } else if (id(menu_selected_page) == 2 ) {
-            return id(menu_selected_2);
-          } else if (id(menu_selected_page) == 3) {
-            return id(menu_selected_3);
-          } else if (id(menu_selected_page) == 4) {
-            return id(menu_selected_4);
-          } else if (id(menu_selected_page) == 41) {
-            return id(menu_selected_41);
-          } else if (id(menu_selected_page) == 42) {
-            return id(menu_selected_42);
-          } else if (id(menu_selected_page) == 43) {
-            return id(menu_selected_43);
-          }
-
-          return id(time_page);
+      - script.execute: refresh_oled
 
 # Sets the time on the device based on the information coming from HA
 time:
@@ -246,24 +242,9 @@ sensor:
           }
           id(menu_selected_page)++;
           return;
-      - display.page.show: !lambda |-
-          if (id(menu_selected_page) == 1) {
-            return id(menu_selected_1);
-          } else if (id(menu_selected_page) == 2 ) {
-            return id(menu_selected_2);
-          } else if (id(menu_selected_page) == 3) {
-            return id(menu_selected_3);
-          } else if (id(menu_selected_page) == 4) {
-            return id(menu_selected_4);
-          } else if (id(menu_selected_page) == 41) {
-            return id(menu_selected_41);
-          } else if (id(menu_selected_page) == 42) {
-            return id(menu_selected_42);
-          }
-          return id(menu_selected_43);
       - lambda: |-
           ESP_LOGD("display-page", "menu selected page: %d", id(menu_selected_page));
-      - component.update: oled_display
+      - script.execute: refresh_oled
     on_anticlockwise:
       - lambda: |-
           id(menu_timer) = 10;
@@ -276,22 +257,7 @@ sensor:
           }
           id(menu_selected_page)--;
           return;
-      - display.page.show: !lambda |-
-          if (id(menu_selected_page) == 1) {
-            return id(menu_selected_1);
-          } else if (id(menu_selected_page) == 2 ) {
-            return id(menu_selected_2);
-          } else if (id(menu_selected_page) == 3) {
-            return id(menu_selected_3);
-          } else if (id(menu_selected_page) == 4) {
-            return id(menu_selected_4);
-          } else if (id(menu_selected_page) == 41) {
-            return id(menu_selected_41);
-          } else if (id(menu_selected_page) == 42) {
-            return id(menu_selected_42);
-          }
-          return id(menu_selected_43);
-      - component.update: oled_display
+      - script.execute: refresh_oled
 
 switch:
   # Exposes a switch in HA that enables or disabled clock mode
@@ -396,21 +362,14 @@ binary_sensor:
                 perform();
             }
             return;
-        - display.page.show: !lambda |-
+        - lambda: |-
             ESP_LOGD("button-press", "Showing page for menu %d", id(menu_selected_page));
-            if (id(menu_selected_page) == 4) {
-              return id(menu_selected_4);
-            } else if (id(menu_selected_page) == 41) {
-              return id(menu_selected_41);
-            }
-            return id(time_page);
-        - component.update: oled_display
+        - script.execute: refresh_oled
 
 light:
   # The actual LED strip as an entity
   - platform: esp32_rmt_led_strip
     chipset: ws2812
-    rmt_channel: 0
     pin: GPIO32
     num_leds: 30
     rgb_order: GRB
@@ -438,12 +397,12 @@ light:
 
             int column = 6;
             const int TIME_PARTS [column] = {
-              floor(time.hour / 10),   // first_hour_digit
-              (int) time.hour % 10,    // last_hour_digit
-              floor(time.minute / 10), // first_minute_digit
-              (int) time.minute % 10,  // last_minute_digit
-              floor(time.second / 10), // first_second_digit
-              (int) time.second % 10,  // last_second_digit
+              time.hour / 10,   // first_hour_digit
+              time.hour % 10,   // last_hour_digit
+              time.minute / 10, // first_minute_digit
+              time.minute % 10, // last_minute_digit
+              time.second / 10, // first_second_digit
+              time.second % 10, // last_second_digit
             };
 
             int row = 4;
@@ -601,114 +560,201 @@ light:
                 it[18 + i] = purple - night_compensation - absolute_brightness;
             }
 
+# Mono OLED panels light up every pixel that is not pure black, so the whole
+# palette is just "off" and "on".
+color:
+  - id: oled_off
+    hex: "000000"
+  - id: oled_on
+    hex: "FFFFFF"
+
 display:
-  # The small OLED screen operation
+  # The small OLED screen. LVGL owns the drawing now, so this carries no lambda
+  # and must not clear itself. The panel is pushed from LVGL's on_draw_end below
+  # rather than on a fixed interval, so turning the encoder shows up straight
+  # away instead of waiting for the next tick.
   - platform: ssd1306_i2c
     model: "SSD1306 128x64"
     reset_pin: 0
     address: 0x3C
     contrast: 0.4
-    update_interval: 2s
+    update_interval: never
+    auto_clear_enabled: false
     id: oled_display
-    pages:
-      # I do use pages for this, since it allows me to keep code simpler. Bit repetitive for menus, but easier to read
-      - id: time_page
-        lambda: |-
-          it.fill(COLOR_OFF);
-          if (id(oled_screen_enabled_flag) == true) {
-            auto time = id(local_time).now();
 
-            it.strftime(0, 0, id(font_time), "%H", time);
-            it.strftime(65, 0, id(font_time), "%M", time);
-            if ((int) time.second % 2 == 1) {
-              it.printf(55, 0, id(font_time), ".");
+lvgl:
+  displays:
+    - oled_display
+  buffer_size: 100%
+  on_draw_end:
+    - component.update: oled_display
+  pages:
+    - id: clock_page
+      bg_color: oled_off
+      bg_opa: COVER
+      widgets:
+        # Wrapped in a container purely so the "OLED screen enabled" switch can
+        # blank the clock by hiding one widget instead of four.
+        - obj:
+            id: clock_body
+            x: 0
+            y: 0
+            width: 128
+            height: 64
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label:
+                  id: lbl_oled_hour
+                  x: 0
+                  y: 0
+                  text_font: font_time
+                  text_color: oled_on
+                  text: "--"
+              - label:
+                  id: lbl_oled_blink
+                  x: 55
+                  y: 0
+                  text_font: font_time
+                  text_color: oled_on
+                  text: "."
+              - label:
+                  id: lbl_oled_minute
+                  x: 65
+                  y: 0
+                  text_font: font_time
+                  text_color: oled_on
+                  text: "--"
+              - label:
+                  id: lbl_oled_date
+                  x: 32
+                  y: 50
+                  text_font: font_date
+                  text_color: oled_on
+                  text: "--.--.----"
+
+    # This single page replaces the seven near-identical ones the file used to
+    # carry: refresh_oled fills in the three rows and moves the outline box,
+    # instead of every selection being spelled out longhand.
+    - id: menu_page
+      bg_color: oled_off
+      bg_opa: COVER
+      widgets:
+        - obj:
+            id: menu_highlight
+            x: 0
+            y: 0
+            width: 128
+            height: 21
+            bg_opa: TRANSP
+            border_color: oled_on
+            border_width: 1
+            radius: 0
+            pad_all: 0
+            scrollable: false
+        - label:
+            id: menu_row_1
+            x: 2
+            y: 2
+            text_font: font_date
+            text_color: oled_on
+            text: ""
+        - label:
+            id: menu_row_2
+            x: 2
+            y: 22
+            text_font: font_date
+            text_color: oled_on
+            text: ""
+        - label:
+            id: menu_row_3
+            x: 2
+            y: 44
+            text_font: font_date
+            text_color: oled_on
+            text: ""
+
+script:
+  # The single owner of what the OLED shows. The four call sites that each used
+  # to carry their own copy of the page-selection if/else now just call this.
+  - id: refresh_oled
+    mode: single
+    then:
+      - lambda: |-
+          const int selected = id(menu_selected_page);
+          if (selected != 0) {
+            static const char *const MAIN_MENU[4] = {
+              "Easy binary", "Complex binary", "Percentage", "Off",
+            };
+            static const char *const TIMER_MENU[3] = {
+              "Previous", "Hour", "3 hours",
+            };
+            // Y positions of the three rows, so the box frames one at a time.
+            static const int HIGHLIGHT_Y[3] = {0, 21, 43};
+
+            const char *rows[3];
+            int highlighted;
+            if (selected >= 41) {
+              for (int i = 0; i < 3; i++) {
+                rows[i] = TIMER_MENU[i];
+              }
+              highlighted = selected - 41;
             } else {
-              it.printf(55, 0, id(font_time), " ");
+              // The main menu holds four entries but only three rows fit, so the
+              // window scrolls by one once the selection passes the second entry.
+              const int first = selected <= 2 ? 0 : 1;
+              for (int i = 0; i < 3; i++) {
+                rows[i] = MAIN_MENU[first + i];
+              }
+              highlighted = selected - 1 - first;
             }
-            it.strftime(32, 50, id(font_date), "%d-%m-%Y", time);
+
+            lv_label_set_text(id(menu_row_1), rows[0]);
+            lv_label_set_text(id(menu_row_2), rows[1]);
+            lv_label_set_text(id(menu_row_3), rows[2]);
+            if (highlighted >= 0 && highlighted <= 2) {
+              lv_obj_set_y(id(menu_highlight), HIGHLIGHT_Y[highlighted]);
+            }
           }
 
-      #      - id: notification_page
-      #        lambda: |-
-      #          int NOTIFICATION_TIMER = 8;
-      #
-      #          static int notification_seconds_counter = NOTIFICATION_TIMER;
-      #          static struct {
-      #            int notification_counter = 0;
-      #            const char* message = "";
-      #          } notification;
-      #
-      #          if (notification.notification_counter != id(mqtt_notification_counter)) {
-      #            notification.message = id(broker_notifications).state.c_str();
-      #            notification.notification_counter = id(mqtt_notification_counter);
-      #            // We might have gotten a new message while an old one was still displaying, reset counter
-      #            notification_seconds_counter = NOTIFICATION_TIMER;
-      #          }
-      #
-      #          it.fill(COLOR_OFF);
-      #          it.rectangle(0, 0, 128, 64);
-      #
-      #          it.printf(2, 2, id(font_notifications), "%s", notification.message);
-      #          it.printf(2, 47, id(font_date), "Hides in %d", notification_seconds_counter);
-      #
-      #          notification_seconds_counter -= 1;
-      #          if (notification_seconds_counter == 0) {
-      #            notification_seconds_counter = NOTIFICATION_TIMER;
-      #            it.show_page(id(time_page));
-      #          }
+          // Blinks once a second, as the old hand-drawn separator did.
+          const auto now = id(local_time).now();
+          lv_label_set_text(id(lbl_oled_blink),
+                            (now.is_valid() && now.second % 2 == 1) ? "." : " ");
 
-      - id: menu_selected_1
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 0, 128, 21);
-          it.printf(2, 2, id(font_date), "Easy binary");
-          it.printf(2, 22, id(font_date), "Complex binary");
-          it.printf(2, 44, id(font_date), "Percentage");
-
-      - id: menu_selected_2
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 21, 128, 21);
-          it.printf(2, 2, id(font_date), "Easy binary");
-          it.printf(2, 22, id(font_date), "Complex binary");
-          it.printf(2, 44, id(font_date), "Percentage");
-
-      - id: menu_selected_3
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 21, 128, 21);
-          it.printf(2, 2, id(font_date), "Complex binary");
-          it.printf(2, 22, id(font_date), "Percentage");
-          it.printf(2, 44, id(font_date), "Off");
-
-      - id: menu_selected_4
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 43, 128, 21);
-          it.printf(2, 2, id(font_date), "Complex binary");
-          it.printf(2, 22, id(font_date), "Percentage");
-          it.printf(2, 44, id(font_date), "Off");
-
-      - id: menu_selected_41
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 0, 128, 21);
-          it.printf(2, 2, id(font_date), "Previous");
-          it.printf(2, 22, id(font_date), "Hour");
-          it.printf(2, 44, id(font_date), "3 hours");
-
-      - id: menu_selected_42
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 21, 128, 21);
-          it.printf(2, 2, id(font_date), "Previous");
-          it.printf(2, 22, id(font_date), "Hour");
-          it.printf(2, 44, id(font_date), "3 hours");
-
-      - id: menu_selected_43
-        lambda: |-
-          it.fill(COLOR_OFF);
-          it.rectangle(0, 43, 128, 21);
-          it.printf(2, 2, id(font_date), "Previous");
-          it.printf(2, 22, id(font_date), "Hour");
-          it.printf(2, 44, id(font_date), "3 hours");
+          // The "OLED screen enabled" switch only ever blanked the clock and
+          // left the menu reachable, so keep it that way.
+          if (id(oled_screen_enabled_flag)) {
+            lv_obj_remove_flag(id(clock_body), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(clock_body), LV_OBJ_FLAG_HIDDEN);
+          }
+      - lvgl.label.update:
+          id: lbl_oled_hour
+          text:
+            time_format: "%H"
+            time: local_time
+      - lvgl.label.update:
+          id: lbl_oled_minute
+          text:
+            time_format: "%M"
+            time: local_time
+      - lvgl.label.update:
+          id: lbl_oled_date
+          text:
+            time_format: "%d-%m-%Y"
+            time: local_time
+      - if:
+          condition:
+            lambda: 'return id(menu_selected_page) != 0 && !id(oled_menu_visible);'
+          then:
+            - lvgl.page.show: menu_page
+            - lambda: 'id(oled_menu_visible) = true;'
+      - if:
+          condition:
+            lambda: 'return id(menu_selected_page) == 0 && id(oled_menu_visible);'
+          then:
+            - lvgl.page.show: clock_page
+            - lambda: 'id(oled_menu_visible) = false;'
