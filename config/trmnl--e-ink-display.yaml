@@ -625,14 +625,21 @@ script:
           const std::string now_iso = now_time.strftime("%Y-%m-%dT%H:%M:%S");
 
           // A multi-day event has to appear on every day it covers, so match on
-          // the date range instead of on the event's start date alone. Home
-          // Assistant reports the end date of all-day events exclusively.
+          // the date range instead of on the event's start date alone. Two kinds
+          // of end date are exclusive: Home Assistant reports all-day events
+          // that way, and a timed event ending at exactly midnight stops at the
+          // start of that day rather than reaching into it, so 23:00-00:00
+          // belongs to the evening it started and not to the day after.
           auto occurs_on = [](const CalendarEvent &event, const std::string &date) {
             if (event.start.length() < 10 || event.end.length() < 10 || event.start.substr(0, 10) > date) {
               return false;
             }
             bool all_day = event.start.length() <= 11 || event.start[10] != 'T';
-            return all_day ? date < event.end.substr(0, 10) : date <= event.end.substr(0, 10);
+            bool ends_at_midnight = !all_day && event.end.length() >= 16 && event.end[10] == 'T' &&
+                                    event.end.compare(11, 5, "00:00") == 0 &&
+                                    (event.end.length() < 19 || event.end.compare(17, 2, "00") == 0);
+            return (all_day || ends_at_midnight) ? date < event.end.substr(0, 10)
+                                                 : date <= event.end.substr(0, 10);
           };
 
           auto timed_event_has_ended = [&now_iso](const CalendarEvent &event) {
