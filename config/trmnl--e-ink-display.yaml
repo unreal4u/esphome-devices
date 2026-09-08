@@ -138,6 +138,18 @@ text_sensor:
       then:
         - script.execute: request_dashboard_update
 
+  # Home Connect enum: Inactive, Ready, DelayedStart, Run, Pause,
+  # ActionRequired, Finished, Error or Aborting. Only Run and Finished put
+  # anything on screen.
+  - platform: homeassistant
+    entity_id: sensor.wasmachine_operation_state
+    name: "Washing machine state"
+    id: washing_machine_state
+    filters: *only_on_change
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
+
 binary_sensor:
   # Feeds the layout switch below: dashboard while someone is in the kitchen,
   # full-screen clock when the room is empty. A real binary_sensor rather than
@@ -231,6 +243,22 @@ sensor:
     on_value:
       then:
         - script.execute: request_dashboard_update
+  # Counts down while a programme runs, in hours as a fraction, so 1.75 means
+  # one hour and forty-five minutes. Unavailable whenever the machine is not
+  # running, which arrives here as NaN.
+  #
+  # Deliberately without an on_value refresh. The panel already redraws every
+  # minute for the clock and picks the new figure up then, so requesting one
+  # here would only add a second e-paper refresh in the same minute, every
+  # minute, for the length of a wash.
+  - platform: homeassistant
+    entity_id: sensor.wasmachine_estimated_total_program_time
+    name: "Washing machine program time"
+    id: washing_machine_program_time
+    # A minute is the smallest step the panel can show, and this is what one
+    # minute is worth in hours.
+    filters:
+      - delta: 0.0166
 
   # TRMNL OG DIY kit: GPIO1 senses battery through a 2x divider, GPIO6 enables it
   - platform: adc
@@ -563,6 +591,25 @@ script:
             snprintf(printing, sizeof(printing), "\U000F0E5B Printing %0.0f%%",
                      id(printer_progress).state);
             notifications[count++] = printing;
+          }
+          // The machine is named by its icon alone: spelling it out as well
+          // overflows the 289px row into an ellipsis.
+          if (id(washing_machine_state).state == "Finished") {
+            notifications[count++] = "\U000F072A Done";
+          } else if (id(washing_machine_state).state == "Run" &&
+                     !isnan(id(washing_machine_program_time).state)) {
+            // Clamped to a day so the hour field cannot widen the row, and so a
+            // nonsense reading cannot overrun the buffer.
+            int minutes = (int) lroundf(id(washing_machine_program_time).state * 60.0f);
+            if (minutes < 0) {
+              minutes = 0;
+            } else if (minutes > 24 * 60) {
+              minutes = 24 * 60;
+            }
+            char washing[40];
+            snprintf(washing, sizeof(washing), "\U000F072A ETA: %d:%02d",
+                     minutes / 60, minutes % 60);
+            notifications[count++] = washing;
           }
           if (id(is_night).state == "on") {
             notifications[count++] = "\U000F0594 Night mode";
@@ -1106,6 +1153,7 @@ font:
           "\U000F0594", # mdi-weather-night
           "\U000F096B", # mdi-fountain
           "\U000F07AC", # mdi-car-sports, F1 race week
+          "\U000F072A", # mdi-washing-machine
         ]
   # Status value under the icon of a permanent notification. Only ever holds a
   # short word or a count, so it can be large enough to read across the room

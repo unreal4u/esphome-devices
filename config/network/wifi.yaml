@@ -7,3 +7,8 @@ wifi:
     ssid: "${device_friendly_name}-ap"
     password: !secret wifi_ap_backup_code
 
+# Gives the fallback AP above a reason to exist. Without it the AP still comes
+# up when the network is unreachable, but nothing listens on it, so there is no
+# way to hand the device new credentials short of a USB flash.
+captive_portal:
+

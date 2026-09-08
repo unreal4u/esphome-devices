@@ -6,3 +6,17 @@ services:
     network_mode: "host"
     volumes:
       - ./config/:/config
+  presence-zones:
+    ports:
+      - "42069:42069"
+      - "38080:38080"
+    build:
+      context: ./docker/presence-zones
+      args:
+        BASE_IMAGE: everythingsmarthome/everything-presence-mmwave-configurator:latest
+    image: local/everything-presence-mmwave-configurator:patched
+    container_name: everything-presence-mmwave-configurator
+    environment:
+      - HA_BASE_URL=${HA_BASE_URL}
+      - HA_LONG_LIVED_TOKEN=${HA_LONG_LIVED_TOKEN}
+      - EXTRA_PRESENCE_DEVICES=${EXTRA_PRESENCE_DEVICES}

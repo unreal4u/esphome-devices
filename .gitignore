@@ -1,2 +1,5 @@
 # JetBrains / PhpStorm project files
 .idea/
+
+# Local docker compose secrets (HA base URL + long-lived token)
+.env
