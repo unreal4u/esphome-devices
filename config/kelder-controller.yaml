@@ -511,7 +511,17 @@ sensor:
             const bool would_alarm =
                 (x >= id(mq9_baseline) * id(mq9_leak_ratio).state) ||
                 (x >= id(mq9_baseline) + id(mq9_leak_delta).state);
-            if (would_alarm || id(mq9_leak).state) {
+            if (would_alarm) {
+              // Track upward drift far more slowly than normal instead of
+              // freezing outright. A hard freeze here was a one-way latch:
+              // once tripped, the baseline could never catch up to a
+              // legitimately higher steady state (heater drift, temperature,
+              // humidity), so the alarm stayed on forever until a reboot
+              // re-learned a fresh baseline. A real, fast-rising leak still
+              // outruns this ~10x slower creep and stays flagged; a plateau
+              // caused by ordinary drift gets absorbed over roughly 40
+              // minutes instead of latching permanently.
+              id(mq9_baseline) += (x - id(mq9_baseline)) * 0.0008f;
               return;
             }
             id(mq9_baseline) = 0.996f * id(mq9_baseline) + 0.004f * x;
