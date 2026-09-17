@@ -1,0 +1,258 @@
+# Board: Freenove ESP32-S3 WROOM N8R8 (8MB Flash / 8MB PSRAM) (Freenove)
+# Definition: definitions/boards/freenove-esp32-s3-n8r8/manifest.yaml
+
+substitutions:
+  device_name: bookshelf-esp32-s3
+  device_friendly_name: Bookshelf
+  device_comment: Controls lights and sensors for the bookshelf
+  dallas_pin: "18"
+  dallas_address: "0x920626105350b628"
+  dallas_name: "PCB temperature"
+  # M5Stack Mini ToF-90° (VL53L0X) on Grove I2C.
+  # PCB silkscreen TX/RX is the UART Grove pin order; this unit is I2C:
+  #   D4 / TX / Grove yellow = SDA
+  #   D5 / RX / Grove white  = SCL
+  tof_sda_pin: GPIO4
+  tof_scl_pin: GPIO5
+  tof_nearby_threshold_cm: "50"
+  # Side lights follow the ToF: 10 cm or closer -> 100% brightness, 80 cm -> 10%,
+  # beyond that off. Approaching tracks the distance, moving away fades out.
+  tof_led_near_cm: "10"
+  tof_led_far_cm: "80"
+  tof_led_min_brightness: "0.10"
+  # How much further away the subject must read before it counts as leaving
+  # rather than sensor noise
+  tof_recede_hysteresis_cm: "6"
+  tof_fade_out_ms: "10000"
+  # Slow fade-out only applies if the subject got at least this close; otherwise
+  # they never really settled in, so the lights turn off at the same (fast)
+  # speed they turned on with (the light's default_transition_length).
+  tof_led_slow_fade_approach_cm: "40"
+  tof_occupancy_debounce: 2s
+  # How long a near reading must hold before the lights trust the subject is
+  # actually there, rather than a single spurious close reading
+  tof_nearby_debounce: 450ms
+
+packages:
+  basics: !include .basics.yaml
+  dallas: !include sensors/dallas.yaml
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret bookshelf_controller__apikey_bookshelf-esp32-s3
+
+ota:
+  - platform: esphome
+    password: !secret bookshelf_controller__otapwd_bookshelf-esp32-s3
+
+# Enable logging
+logger:
+  logs:
+    # Hide "Distance is out of range" / "Got distance" DEBUG lines
+    vl53l0x: INFO
+
+# Grove HY2.0-4P: GND, 5V, SDA (yellow/TX), SCL (white/RX)
+# 4.7k pull-ups to 3V3 on both lines keep the edges clean over the ~70cm cable
+i2c:
+  sda: ${tof_sda_pin}
+  scl: ${tof_scl_pin}
+  scan: true
+  id: bus_a
+
+globals:
+  # True when the ToF sensor sees a subject closer than ${tof_nearby_threshold_cm} cm
+  - id: tof_subject_nearby
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+output:
+  - platform: ledc
+    id: LED_CH1
+    pin: 7
+
+  - platform: ledc
+    id: LED_CH2
+    pin: 6
+
+  - platform: ledc
+    id: LED_CH3
+    pin: 1
+
+  - platform: ledc
+    id: LED_CH4
+    pin: 2
+
+  # CH1 and CH4 are physically separate strips, driven together as one light
+  - platform: template
+    id: LED_SIDES
+    type: float
+    write_action:
+      - output.set_level:
+          id: LED_CH1
+          level: !lambda return state;
+      - output.set_level:
+          id: LED_CH4
+          level: !lambda return state;
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_ww
+    channel_colors: GRB
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    name: "on board light"
+
+  - platform: monochromatic
+    id: LIGHT_SIDES
+    icon: "mdi:led-strip"
+    name: "Side lights"
+    output: LED_SIDES
+    default_transition_length: 0.3s
+
+  # Spare channels: wired up and usable from lambdas, but hidden from HA
+  - platform: monochromatic
+    id: LIGHT_CH2
+    icon: "mdi:led-strip"
+    name: "Unused 1"
+    internal: true
+    output: LED_CH2
+    default_transition_length: 0.3s
+
+  - platform: monochromatic
+    id: LIGHT_CH3
+    icon: "mdi:led-strip-variant"
+    name: "Unused 2"
+    internal: true
+    output: LED_CH3
+    default_transition_length: 0.3s
+
+sensor:
+  # Temperature and humidity sensor. Exposed to HA
+  - platform: dht
+    pin: 15
+    model: AM2302
+    temperature:
+      name: "Temperature"
+      accuracy_decimals: 1
+    humidity:
+      name: "Humidity"
+      accuracy_decimals: 1
+    update_interval: 60s
+
+  # M5Stack Mini ToF-90° (VL53L0X)
+  - platform: vl53l0x
+    id: tof_distance
+    name: "Subject distance"
+    device_class: distance
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    address: 0x29
+    long_range: true
+    update_interval: 150ms
+    filters:
+      - multiply: 100  # metres -> centimetres
+    on_raw_value:
+      then:
+        - lambda: |-
+            // Raw value is still in metres (before the cm filter)
+            const bool invalid = isnan(x) || x <= 0.0f;
+            const float cm = invalid ? NAN : x * 100.0f;
+            id(tof_subject_nearby) = !invalid && cm < ${tof_nearby_threshold_cm};
+            id(tof_occupancy).publish_state(!invalid);
+            id(tof_nearby_confirmed).publish_state(!invalid && cm <= ${tof_led_far_cm});
+
+            const float near_cm = ${tof_led_near_cm};
+            const float far_cm = ${tof_led_far_cm};
+            const float slow_fade_approach_cm = ${tof_led_slow_fade_approach_cm};
+
+            // Distance the brightness was last set from, so approaching and
+            // receding can be told apart across readings
+            static float ref_cm = NAN;
+            static bool fading_out = false;
+            // Closest the subject got this time round; decides whether leaving
+            // gets the slow fade or just turns off at the normal on-speed
+            static float closest_cm = NAN;
+
+            // Subject gone: start the fade (slow if they got close, otherwise
+            // at the light's normal speed), once
+            if (invalid || cm > far_cm) {
+              const bool got_close = !isnan(closest_cm) && closest_cm <= slow_fade_approach_cm;
+              ref_cm = NAN;
+              closest_cm = NAN;
+              if (id(LIGHT_SIDES).current_values.is_on() && !fading_out) {
+                fading_out = true;
+                auto call = id(LIGHT_SIDES).turn_off();
+                if (got_close) call.set_transition_length(${tof_fade_out_ms});
+                call.perform();
+              }
+              return;
+            }
+
+            // Not yet tracking a subject: wait for the debounced "nearby"
+            // signal before trusting presence and turning the lights on
+            if (isnan(ref_cm) && !id(tof_nearby_confirmed).state) {
+              return;
+            }
+
+            if (isnan(ref_cm) || cm < ref_cm - 1.0f) {
+              // Approaching: track the distance, cancelling any fade
+              const float min_brightness = ${tof_led_min_brightness};
+              float brightness = min_brightness +
+                  (far_cm - cm) / (far_cm - near_cm) * (1.0f - min_brightness);
+              if (brightness > 1.0f) brightness = 1.0f;  // closer than near_cm
+              ref_cm = cm;
+              fading_out = false;
+              if (isnan(closest_cm) || cm < closest_cm) closest_cm = cm;
+              id(LIGHT_SIDES).turn_on().set_brightness(brightness).perform();
+            } else if (cm > ref_cm + ${tof_recede_hysteresis_cm} && !fading_out) {
+              // Moving away: fade out slowly if they got close enough, otherwise
+              // turn off at the same speed the lights came on with
+              const bool got_close = !isnan(closest_cm) && closest_cm <= slow_fade_approach_cm;
+              ref_cm = cm;
+              fading_out = true;
+              auto call = id(LIGHT_SIDES).turn_off();
+              if (got_close) call.set_transition_length(${tof_fade_out_ms});
+              call.perform();
+            }
+
+binary_sensor:
+  - platform: template
+    id: tof_occupancy
+    name: "Occupancy"
+    device_class: occupancy
+    filters:
+      - delayed_on_off: ${tof_occupancy_debounce}
+
+  # Debounced "subject within light range" signal, published from the ToF
+  # raw-value lambda. Not exposed to HA; the side lights gate on it directly.
+  - platform: template
+    id: tof_nearby_confirmed
+    internal: true
+    filters:
+      - delayed_on: ${tof_nearby_debounce}
+
+# The vl53l0x component has no recovery path: if a measurement never completes,
+# every later update bails out with "update called before prior reading
+# complete" and the sensor stays stuck until the device reboots. Watch for that
+# state persisting and reboot instead of going silently blind.
+interval:
+  - interval: 15s
+    then:
+      - lambda: |-
+          static uint8_t stuck_checks = 0;
+          if (id(tof_distance).status_has_warning()) {
+            if (++stuck_checks >= 4) {  // ~1 minute wedged
+              ESP_LOGE("tof_watchdog", "ToF sensor wedged, rebooting");
+              App.safe_reboot();
+            }
+          } else {
+            stuck_checks = 0;
+          }
