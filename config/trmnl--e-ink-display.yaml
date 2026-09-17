@@ -595,7 +595,7 @@ script:
           // The machine is named by its icon alone: spelling it out as well
           // overflows the 289px row into an ellipsis.
           if (id(washing_machine_state).state == "Finished") {
-            notifications[count++] = "\U000F072A Done";
+            notifications[count++] = "\U000F072A Wash: Done";
           } else if (id(washing_machine_state).state == "Run" &&
                      !isnan(id(washing_machine_program_time).state)) {
             // Clamped to a day so the hour field cannot widen the row, and so a
@@ -607,7 +607,7 @@ script:
               minutes = 24 * 60;
             }
             char washing[40];
-            snprintf(washing, sizeof(washing), "\U000F072A ETA: %d:%02d",
+            snprintf(washing, sizeof(washing), "\U000F072A Wash ETA: %d:%02d",
                      minutes / 60, minutes % 60);
             notifications[count++] = washing;
           }
