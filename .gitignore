@@ -3,3 +3,6 @@
 
 # Local docker compose secrets (HA base URL + long-lived token)
 .env
+
+# Claude Code local settings and state
+.claude/
