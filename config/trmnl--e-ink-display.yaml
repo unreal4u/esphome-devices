@@ -139,8 +139,8 @@ text_sensor:
         - script.execute: request_dashboard_update
 
   # Home Connect enum: Inactive, Ready, DelayedStart, Run, Pause,
-  # ActionRequired, Finished, Error or Aborting. Only Run and Finished put
-  # anything on screen.
+  # ActionRequired, Finished, Error or Aborting. Only DelayedStart, Run and
+  # Finished put anything on screen.
   - platform: homeassistant
     entity_id: sensor.wasmachine_operation_state
     name: "Washing machine state"
@@ -257,6 +257,16 @@ sensor:
     id: washing_machine_program_time
     # A minute is the smallest step the panel can show, and this is what one
     # minute is worth in hours.
+    filters:
+      - delta: 0.0166
+
+  # Counts down to when a delayed-start wash will finish, in the same
+  # hours-as-a-fraction format as the sensor above. Only meaningful while
+  # the machine is in DelayedStart.
+  - platform: homeassistant
+    entity_id: sensor.wasruimte_wasmachine_finish_in
+    name: "Washing machine finish in"
+    id: washing_machine_finish_in
     filters:
       - delta: 0.0166
 
@@ -568,21 +578,26 @@ script:
             id(notification_4), id(notification_5), id(notification_6),
             id(notification_7), id(notification_8),
           };
-          // The wide column only carries alerts that need words. The list is
-          // built most-important-first so that on the rare occasion everything
-          // fires at once, it is the tail that gets dropped.
-          std::string notifications[8];
-          int count = 0;
+          // The wide column only carries alerts that need words. Actionable
+          // items (something to go and do about it) always lead, inverted so
+          // they stand out from the informational ones behind them; within
+          // each group the list is still most-important-first, so on the
+          // rare occasion everything fires at once it is the tail that gets
+          // dropped.
+          std::string actionable[8];
+          int actionable_count = 0;
+          std::string informational[8];
+          int informational_count = 0;
 
           if (id(back_door_open).state == "on") {
-            notifications[count++] = "\U000F081B Back door open";
+            informational[informational_count++] = "\U000F081B Back door open";
           }
           if (id(fan_kelder).state == "on") {
-            notifications[count++] = "\U000F0210 Kelder fan";
+            informational[informational_count++] = "\U000F0210 Kelder fan";
           }
           if (!isnan(id(vacuum_runs_without_cleaning).state) &&
               id(vacuum_runs_without_cleaning).state > 1) {
-            notifications[count++] = "\U000F070D Clean vacuum";
+            actionable[actionable_count++] = "\U000F070D Clean vacuum";
           }
           if (!isnan(id(printer_progress).state) &&
               id(printer_progress).state > 0 &&
@@ -590,43 +605,70 @@ script:
             char printing[32];
             snprintf(printing, sizeof(printing), "\U000F0E5B Printing %0.0f%%",
                      id(printer_progress).state);
-            notifications[count++] = printing;
+            informational[informational_count++] = printing;
           }
           // The machine is named by its icon alone: spelling it out as well
           // overflows the 289px row into an ellipsis.
-          if (id(washing_machine_state).state == "Finished") {
-            notifications[count++] = "\U000F072A Wash: Done";
-          } else if (id(washing_machine_state).state == "Run" &&
-                     !isnan(id(washing_machine_program_time).state)) {
-            // Clamped to a day so the hour field cannot widen the row, and so a
-            // nonsense reading cannot overrun the buffer.
-            int minutes = (int) lroundf(id(washing_machine_program_time).state * 60.0f);
-            if (minutes < 0) {
-              minutes = 0;
-            } else if (minutes > 24 * 60) {
-              minutes = 24 * 60;
+          if (strcasecmp(id(washing_machine_state).state.c_str(), "Finished") == 0) {
+            actionable[actionable_count++] = "\U000F072A Wash: Done";
+          } else {
+            // DelayedStart's countdown already includes the wash itself, so it
+            // replaces rather than adds to the plain program-time countdown.
+            float eta_hours = NAN;
+            if (strcasecmp(id(washing_machine_state).state.c_str(), "Delayed start") == 0) {
+              eta_hours = id(washing_machine_finish_in).state;
+            } else if (strcasecmp(id(washing_machine_state).state.c_str(), "Run") == 0) {
+              eta_hours = id(washing_machine_program_time).state;
             }
-            char washing[40];
-            snprintf(washing, sizeof(washing), "\U000F072A Wash ETA: %d:%02d",
-                     minutes / 60, minutes % 60);
-            notifications[count++] = washing;
+            if (!isnan(eta_hours)) {
+              // Clamped to a day so the hour field cannot widen the row, and so a
+              // nonsense reading cannot overrun the buffer.
+              int minutes = (int) lroundf(eta_hours * 60.0f);
+              if (minutes < 0) {
+                minutes = 0;
+              } else if (minutes > 24 * 60) {
+                minutes = 24 * 60;
+              }
+              char washing[40];
+              snprintf(washing, sizeof(washing), "\U000F072A Wash ETA: %d:%02d",
+                       minutes / 60, minutes % 60);
+              informational[informational_count++] = washing;
+            }
           }
           if (id(is_night).state == "on") {
-            notifications[count++] = "\U000F0594 Night mode";
+            informational[informational_count++] = "\U000F0594 Night mode";
           } else if (id(is_dark).state == "on") {
-            notifications[count++] = "\U000F059A Dark mode";
+            informational[informational_count++] = "\U000F059A Dark mode";
           }
           if (id(water_fountain_must_be_cleaned).state == "on") {
-            notifications[count++] = "\U000F096B Clean fountain";
+            actionable[actionable_count++] = "\U000F096B Clean fountain";
           }
           if (id(f1_race_week).state == "on") {
-            notifications[count++] = "\U000F07AC Rawe Ceek";
+            informational[informational_count++] = "\U000F07AC Rawe Ceek";
+          }
+
+          std::string notifications[8];
+          int count = 0;
+          for (int i = 0; i < actionable_count && count < 8; i++) {
+            notifications[count++] = actionable[i];
+          }
+          for (int i = 0; i < informational_count && count < 8; i++) {
+            notifications[count++] = informational[i];
           }
 
           for (int slot = 0; slot < 8; slot++) {
             if (slot < count) {
               lv_label_set_text(notification_labels[slot], notifications[slot].c_str());
               lv_obj_remove_flag(notification_labels[slot], LV_OBJ_FLAG_HIDDEN);
+              // Actionable slots invert, same as the tariff indicator above,
+              // so they read as "do something" against the informational
+              // ones' plain text.
+              const bool is_actionable = slot < actionable_count;
+              lv_obj_set_style_bg_opa(notification_labels[slot],
+                                      is_actionable ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+              lv_obj_set_style_bg_color(notification_labels[slot], ink, LV_PART_MAIN);
+              lv_obj_set_style_text_color(notification_labels[slot],
+                                          is_actionable ? paper : ink, LV_PART_MAIN);
             } else {
               lv_obj_add_flag(notification_labels[slot], LV_OBJ_FLAG_HIDDEN);
             }
