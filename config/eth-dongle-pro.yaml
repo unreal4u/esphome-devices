@@ -1,0 +1,29 @@
+substitutions:
+  name: p1-meter-dongle
+packages:
+  smartstuff.eth_dongle_pro: github://mhendriks/esphome-p1/p1ep.yaml@main
+esphome:
+  name: ${name}
+  name_add_mac_suffix: False
+api:
+  encryption:
+    key: !secret apikey_p1-meter-dongle
+
+#logger:
+#  level: VERBOSE
+
+button:
+  - platform: factory_reset
+    name: "_Restart with Factory Default Settings"
+    internal: True
+
+text_sensor:
+  # Exposes the version of the firmware to HA
+  - platform: version
+    name: version
+
+sensor:
+  # Exposes the uptime in seconds to HA
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 3s
