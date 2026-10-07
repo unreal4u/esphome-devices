@@ -105,7 +105,7 @@ network:
     - ethernet
     - wifi
 
-# Patched copy of ESPHome 2026.9.0's ethernet component: the upstream W5500 driver mixes polling and
+# Patched copy of ESPHome 2026.9.1's ethernet component: the upstream W5500 driver mixes polling and
 # interrupt SPI transactions, which crashes in spi_bus_lock_bg_exit(). Must match the running
 # ESPHome version; drop this once upstream fixes it. See config/components/ethernet/w5500_custom_spi.cpp
 external_components:
