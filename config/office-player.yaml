@@ -17,6 +17,11 @@ substitutions:
   # this just suppresses it from actually firing at runtime.
   media_player_led_control: "false"
 
+  # ----------------------------------------------------------------
+  # Original settings (mostly) copied from here:
+  # https://github.com/sonocotta/esp32-audio-dock/blob/main/firmware/esphome/1-hifi-esp32/hifi-esp32-s3-idf-sendspin.yaml
+  # ----------------------------------------------------------------
+
   # ===== Board-Specific Pinouts =====
   # I2S audio pins
   i2s_lrclk_pin: GPIO15
@@ -72,7 +77,7 @@ esp32:
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
 
 logger:
-  level: INFO
+  level: DEBUG
 
 api:
   encryption:
@@ -92,10 +97,34 @@ psram:
   ignore_not_found: false
 
 network:
+  # Disabling ipv6 completely does also get rid of the error
   enable_ipv6: true
+  # This might help as well: https://github.com/sonocotta/esp32-audio-dock/issues/183
+  #enable_high_performance: false
   priority:
     - ethernet
     - wifi
+
+# Patched copy of ESPHome 2026.9.0's ethernet component: the upstream W5500 driver mixes polling and
+# interrupt SPI transactions, which crashes in spi_bus_lock_bg_exit(). Must match the running
+# ESPHome version; drop this once upstream fixes it. See config/components/ethernet/w5500_custom_spi.cpp
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ethernet]
+
+# Internal (non-PSRAM) heap headroom — not covered by monitoring.yaml's "Free PSRAM"
+# sensor. The w5500 driver's rx buffers must come from internal DMA-capable heap,
+# so this is what actually explains "no mem for receive buffer" drops if it happens.
+sensor:
+  - platform: debug
+    free:
+      name: "${friendly_name} Heap Free"
+    min_free:
+      name: "${friendly_name} Heap Min Free"
+    fragmentation:
+      name: "${friendly_name} Heap Fragmentation"
 
 # Only one of these populates depending on which interface actually came up (see network.priority above)
 text_sensor:
@@ -114,7 +143,7 @@ text_sensor:
 #   3. Update `ref:` below and bump the date/comment.
 #   4. Clear the local package cache so it re-fetches instead of reusing a stale clone:
 #      rm -rf config/.esphome/packages/<hash-for-this-package>
-#   5. Compile + flash one device first; Sendspin is still experimental upstream, so don't roll to all rooms at once.
+#   5. Compile + flash one device first; Sendspin is still experimental upstream, so don't roll to all devices at once.
 packages:
   esparagus_remote:
     url: https://github.com/sonocotta/esp32-audio-dock
