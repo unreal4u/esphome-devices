@@ -1,0 +1,59 @@
+substitutions:
+  device_name: stair-upper-floor-controller
+  device_friendly_name: Stair upper floor controller
+  device_comment: Controls lights and sensors related to the upper section of the stairs
+  ld2450_tx_pin: "4"
+  ld2450_rx_pin: "5"
+  dallas_pin: "18"
+  dallas_address: "0x380316a27953b428"
+  dallas_name: "PCB temperature"
+
+packages:
+  basics: !include .basics.yaml
+  ld2450: !include sensors/ld2450.yaml
+  dallas: !include sensors/dallas.yaml
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_stair-controller
+
+ota:
+  - platform: esphome
+    password: !secret otapwd_stair-controller
+
+wifi:
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Stair-Upper-Floor-Controller"
+    password: !secret wifi_ap_backup_code
+
+binary_sensor:
+  # Reports when the switch changes state.
+  - platform: gpio
+    pin:
+      number: 14
+      mode: INPUT_PULLUP
+      inverted: False
+    name: Slaapkamer door
+    device_class: door
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 100ms
+
+  # Reports when the switch changes state.
+  - platform: gpio
+    pin:
+      number: 13
+      mode: INPUT_PULLUP
+      inverted: False
+    name: Office door
+    device_class: door
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 100ms

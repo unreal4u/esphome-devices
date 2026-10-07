@@ -1,0 +1,102 @@
+substitutions:
+  device_name: meterkast-esp32-s3
+  device_friendly_name: Meterkast ESP32-S3
+  device_comment: Controls lights and sensors inside the meterkast
+  dallas_pin: "18"
+  dallas_address: "0xe30316a27964cd28"
+  dallas_name: "PCB temperature"
+
+packages:
+  basics: !include .basics.yaml
+  dallas: !include sensors/dallas.yaml
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey_meterkast-esp32-s3
+
+ota:
+  - platform: esphome
+    password: !secret otapwd_meterkast-esp32-s3
+
+# Enable logging
+logger:
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_ww
+    rgb_order: GRB
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    name: "on board light"
+
+  - platform: monochromatic
+    name: "Overview light meterkast"
+    id: overview_light
+    output: overview_light_meterkast
+
+output:
+  - platform: ledc
+    id: overview_light_meterkast
+    pin: GPIO7
+
+binary_sensor:
+  # Reports when the switch changes state.
+  - platform: gpio
+    id: door_sensor
+    pin:
+      number: 14
+      mode: INPUT_PULLUP
+      inverted: False
+    name: Meterkast door
+    device_class: door
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 100ms
+    on_press:
+      then:
+        - light.turn_on: overview_light
+        - component.update: external_temperature_sensor
+    on_release:
+      then:
+        - light.turn_off: overview_light
+        - component.update: external_temperature_sensor
+
+sensor:
+  # Temperature and humidity sensor. Exposed to HA
+  - platform: dht
+    pin: GPIO10
+    id: external_temperature_sensor
+    model: AM2302
+    temperature:
+      name: "Temperature"
+      accuracy_decimals: 1
+      on_value:
+        then:
+          - light.turn_on:
+              id: led_ww
+              brightness: !lambda |-
+                if (id(door_sensor).state) {
+                  return 0.8;
+                } else {
+                  return 0.01;
+                }
+              red: !lambda |-
+                if (x <= 25.0) return 0.0;
+                if (x >= 38.0) return 1.0;
+                return (x - 25.0) / (38.0 - 25.0);
+              green: !lambda |-
+                if (x <= 25.0) return 1.0;
+                if (x >= 38.0) return 0.0;
+                return 1.0 - ((x - 25.0) / (38.0 - 25.0));
+              blue: 0%
+    humidity:
+      name: "Humidity"
+      accuracy_decimals: 1
+    update_interval: 60s
