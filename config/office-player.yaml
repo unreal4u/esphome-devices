@@ -11,6 +11,7 @@
 substitutions:
   name: office-player
   friendly_name: Office Player
+  device_friendly_name: ${friendly_name}
   task_stack_in_psram: "true"
   # No physical LED on this board (Rev G2), but sendspin.yaml hard-requires the `light:`
   # domain to exist (light.turn_on/off action type), so light.yaml stays included below;
@@ -87,23 +88,17 @@ ota:
   platform: esphome
   password: !secret office_player__ota_password
 
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-
 psram:
   mode: octal
   speed: 80MHz
   ignore_not_found: false
 
 network:
-  # Disabling ipv6 completely does also get rid of the error
-  enable_ipv6: true
-  # This might help as well: https://github.com/sonocotta/esp32-audio-dock/issues/183
-  #enable_high_performance: false
-  priority:
-    - ethernet
-    - wifi
+  enable_ipv6: false
+  # Uncomment together with the wifi_network package below
+  # priority:
+  #   - ethernet
+  #   - wifi
 
 # Patched copy of ESPHome 2026.9.1's ethernet component: the upstream W5500 driver mixes polling and
 # interrupt SPI transactions, which crashes in spi_bus_lock_bg_exit(). Must match the running
@@ -126,14 +121,10 @@ sensor:
     fragmentation:
       name: "${friendly_name} Heap Fragmentation"
 
-# Only one of these populates depending on which interface actually came up (see network.priority above)
 text_sensor:
   - platform: ethernet_info
     ip_address:
       name: Ethernet IP Address
-  - platform: wifi_info
-    ip_address:
-      name: WiFi IP Address
 
 # ===== Packages =====
 # Updating the esparagus_remote pin:
@@ -145,6 +136,10 @@ text_sensor:
 #      rm -rf config/.esphome/packages/<hash-for-this-package>
 #   5. Compile + flash one device first; Sendspin is still experimental upstream, so don't roll to all devices at once.
 packages:
+  # WiFi is off on purpose: with WiFi and ethernet on the same subnet, lwIP sends part of the
+  # traffic out over WiFi. To re-enable it, uncomment the following line:
+  # wifi_network: !include network/wifi.yaml
+
   esparagus_remote:
     url: https://github.com/sonocotta/esp32-audio-dock
     # Pinned to main HEAD as of 2026-10-07 (esp32-audio-dock #187, W5500 clock_speed 8MHz).

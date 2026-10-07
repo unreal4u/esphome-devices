@@ -1,6 +1,12 @@
+substitutions:
+  device_friendly_name: Office lamp
+
+packages:
+  wifi_network: !include network/wifi.yaml
+
 esphome:
   name: "office-background-lamp"
-  friendly_name: Office lamp
+  friendly_name: ${device_friendly_name}
   comment: "Lamp that serves as background lighting for late at night at the office"
 
 esp8266:
@@ -17,15 +23,6 @@ api:
 ota:
   - platform: esphome
     password: !secret otapwd_office_background_lamp
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-  ap:
-    ssid: "Office-Lamp Fallback Hotspot"
-    password: !secret wifi_ap_backup_code
 
 output:
   - platform: gpio

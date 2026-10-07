@@ -27,12 +27,6 @@ ota:
   - platform: esphome
     password: !secret otapwd_stair-controller
 
-wifi:
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-  ap:
-    ssid: "Stair-Upper-Floor-Controller"
-    password: !secret wifi_ap_backup_code
-
 binary_sensor:
   # Reports when the switch changes state.
   - platform: gpio
