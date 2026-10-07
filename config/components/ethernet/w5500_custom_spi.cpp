@@ -53,15 +53,15 @@ esp_err_t w5500_custom_spi_deinit(void *spi_ctx) {
   return ESP_OK;
 }
 
-// LOCAL PATCH: upstream sends transfers <= 64 bytes via spi_device_polling_transmit(). Mixing that
-// with interrupt transactions on one device races the SPI ISR's spi_bus_lock_bg_exit() against the
-// polling bus-lock acquire/release (NULL lock->acquiring_dev, LoadProhibited in spi_bus_lock.c),
-// so every transfer goes through the interrupt path.
+// LOCAL PATCH: upstream sends transfers > 64 bytes via interrupt transactions and the rest via polling.
+// Mixing both on one device races the SPI ISR's spi_bus_lock_bg_exit() against the polling bus-lock
+// acquire/release (NULL lock->acquiring_dev, LoadProhibited in spi_bus_lock.c). Interrupt-only kept
+// ethernet from ever sending a DHCP request, so every transfer polls, as the stock ESP-IDF W5500 driver does.
 esp_err_t w5500_custom_spi_transfer(W5500CustomSpiContext *ctx, spi_transaction_t *trans) {
   if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) != pdTRUE) {
     return ESP_ERR_TIMEOUT;
   }
-  esp_err_t ret = spi_device_transmit(ctx->handle, trans);
+  esp_err_t ret = spi_device_polling_transmit(ctx->handle, trans);
   xSemaphoreGive(ctx->lock);
   return ret;
 }

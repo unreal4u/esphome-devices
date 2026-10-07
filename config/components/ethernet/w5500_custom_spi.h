@@ -22,7 +22,7 @@ namespace esphome::ethernet {
 // one large write per transmitted frame) is by far the biggest transfer, so the RX task and the TX
 // caller each spin for hundreds of microseconds per frame. This driver sends payload transfers
 // through the blocking, interrupt-driven spi_device_transmit() instead, so the calling task sleeps
-// while DMA moves the bytes. LOCAL PATCH: small register accesses also use the interrupt path, see
+// while DMA moves the bytes. LOCAL PATCH: every transfer uses the polling path again, see
 // w5500_custom_spi_transfer() for why.
 //
 // Must be called before esp_eth_mac_new_w5500(). The driver reads spi_host_id and spi_devcfg back
