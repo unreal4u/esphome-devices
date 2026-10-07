@@ -147,8 +147,8 @@ text_sensor:
 packages:
   esparagus_remote:
     url: https://github.com/sonocotta/esp32-audio-dock
-    # Pinned to main HEAD as of 2026-09-21 (esphome-audio-dock #184).
-    ref: 302ba5bedfdd50248b9bdb21024c33086fe854aa
+    # Pinned to main HEAD as of 2026-10-07 (esp32-audio-dock #187, W5500 clock_speed 8MHz).
+    ref: c5dfe5274cc2b6b22ce57e2d1a9368ccbdb20ead
     files:
       - firmware/esphome/packages/audio.yaml
       - firmware/esphome/packages/sendspin.yaml
