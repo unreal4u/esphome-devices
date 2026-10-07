@@ -130,6 +130,15 @@ text_sensor:
         - script.execute: request_dashboard_update
 
   - platform: homeassistant
+    entity_id: input_boolean.automatic_curtain_operation
+    name: "Automatic curtain operation"
+    id: automatic_curtain_operation
+    filters: *only_on_change
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
+
+  - platform: homeassistant
     entity_id: binary_sensor.f1_race_week
     name: "F1 race week"
     id: f1_race_week
@@ -615,7 +624,7 @@ script:
             // DelayedStart's countdown already includes the wash itself, so it
             // replaces rather than adds to the plain program-time countdown.
             float eta_hours = NAN;
-            if (strcasecmp(id(washing_machine_state).state.c_str(), "Delayed start") == 0) {
+            if (strcasecmp(id(washing_machine_state).state.c_str(), "DelayedStart") == 0) {
               eta_hours = id(washing_machine_finish_in).state;
             } else if (strcasecmp(id(washing_machine_state).state.c_str(), "Run") == 0) {
               eta_hours = id(washing_machine_program_time).state;
@@ -634,6 +643,9 @@ script:
                        minutes / 60, minutes % 60);
               informational[informational_count++] = washing;
             }
+          }
+          if (id(automatic_curtain_operation).state == "on") {
+            informational[informational_count++] = "\U000F10C2 Blinds override";
           }
           if (id(is_night).state == "on") {
             informational[informational_count++] = "\U000F0594 Night mode";
@@ -674,8 +686,9 @@ script:
             }
           }
       # Fill one chronological agenda with up to seven events. Remaining events
-      # for today come first, followed by tomorrow. Timed events disappear as
-      # soon as their end time has passed; all-day events remain for the day.
+      # for today come first, followed by tomorrow and, when those leave room,
+      # the day after. Timed events disappear as soon as their end time has
+      # passed; all-day events remain for the day.
       - lambda: |-
           constexpr int kSlots = 7;
           constexpr int kRowHeight = 56;
@@ -683,6 +696,8 @@ script:
           constexpr int kTomorrowGap = 16;       // space between today and TOMORROW
           constexpr int kTomorrowHeaderHeight = 32;
           constexpr int kRailDotCentre = 13;     // row top to the middle of the dot
+          constexpr int kCalendarHeight = 464;   // cal_events height
+          constexpr int kMaxEventsBeforeDayAfterTomorrow = 5;
           lv_obj_t *slots[kSlots] = {
             id(cal_slot_1), id(cal_slot_2), id(cal_slot_3),
             id(cal_slot_4), id(cal_slot_5), id(cal_slot_6), id(cal_slot_7),
@@ -711,6 +726,9 @@ script:
           const std::string today_date = now_time.strftime("%Y-%m-%d");
           const std::string tomorrow_date =
             ESPTime::from_epoch_local(now_time.timestamp + 86400).strftime("%Y-%m-%d");
+          ESPTime day_after_tomorrow =
+            ESPTime::from_epoch_local(now_time.timestamp + 2 * 86400);
+          const std::string day_after_tomorrow_date = day_after_tomorrow.strftime("%Y-%m-%d");
           const std::string now_iso = now_time.strftime("%Y-%m-%dT%H:%M:%S");
 
           // A multi-day event has to appear on every day it covers, so match on
@@ -746,8 +764,10 @@ script:
           // events on the same date.
           const CalendarEvent *today_events[kSlots] = {};
           const CalendarEvent *tomorrow_events[kSlots] = {};
+          const CalendarEvent *day_after_tomorrow_events[kSlots] = {};
           int today_count = 0;
           int tomorrow_count = 0;
+          int day_after_tomorrow_count = 0;
           auto insert_event = [&](const CalendarEvent *event,
                                   const CalendarEvent **events, int &count) {
             int position = count;
@@ -777,6 +797,9 @@ script:
             }
             if (occurs_on(event, tomorrow_date)) {
               insert_event(&event, tomorrow_events, tomorrow_count);
+            }
+            if (occurs_on(event, day_after_tomorrow_date)) {
+              insert_event(&event, day_after_tomorrow_events, day_after_tomorrow_count);
             }
           }
 
@@ -814,6 +837,51 @@ script:
             lv_obj_set_y(id(cal_tomorrow_empty),
                          today_block_height + kTomorrowGap + kTomorrowHeaderHeight);
             lv_obj_remove_flag(id(cal_tomorrow_empty), LV_OBJ_FLAG_HIDDEN);
+          }
+
+          // The third day only fills leftover room, so it is dropped entirely
+          // rather than squeezed in when not even its header and one row fit.
+          const int tomorrow_block_height =
+            tomorrow_shown > 0 ? tomorrow_shown * kRowHeight : kEmptyTodayHeight;
+          const int day_after_tomorrow_y = today_block_height + kTomorrowGap +
+                                           kTomorrowHeaderHeight + tomorrow_block_height +
+                                           kTomorrowGap;
+          const int day_after_tomorrow_rows_top = day_after_tomorrow_y + kTomorrowHeaderHeight;
+          int day_after_tomorrow_shown = 0;
+          bool show_day_after_tomorrow = false;
+          if (today_shown + tomorrow_shown <= kMaxEventsBeforeDayAfterTomorrow) {
+            int rows_that_fit = (kCalendarHeight - day_after_tomorrow_rows_top) / kRowHeight;
+            if (rows_that_fit < 0) {
+              rows_that_fit = 0;
+            }
+            day_after_tomorrow_shown = day_after_tomorrow_count;
+            if (day_after_tomorrow_shown > kSlots - today_shown - tomorrow_shown) {
+              day_after_tomorrow_shown = kSlots - today_shown - tomorrow_shown;
+            }
+            if (day_after_tomorrow_shown > rows_that_fit) {
+              day_after_tomorrow_shown = rows_that_fit;
+            }
+            show_day_after_tomorrow =
+              day_after_tomorrow_shown > 0 ||
+              (day_after_tomorrow_count == 0 &&
+               day_after_tomorrow_rows_top + kEmptyTodayHeight <= kCalendarHeight);
+          }
+          if (show_day_after_tomorrow) {
+            std::string header = day_after_tomorrow.strftime("%A %d-%m-%y");
+            for (char &c : header) {
+              c = toupper((unsigned char) c);
+            }
+            lv_label_set_text(id(cal_day_after_tomorrow_header_text), header.c_str());
+            lv_obj_set_y(id(cal_day_after_tomorrow_header), day_after_tomorrow_y);
+            lv_obj_remove_flag(id(cal_day_after_tomorrow_header), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(cal_day_after_tomorrow_header), LV_OBJ_FLAG_HIDDEN);
+          }
+          if (show_day_after_tomorrow && day_after_tomorrow_shown == 0) {
+            lv_obj_set_y(id(cal_day_after_tomorrow_empty), day_after_tomorrow_rows_top);
+            lv_obj_remove_flag(id(cal_day_after_tomorrow_empty), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(cal_day_after_tomorrow_empty), LV_OBJ_FLAG_HIDDEN);
           }
 
           for (int slot = 0; slot < kSlots; slot++) {
@@ -863,6 +931,10 @@ script:
                          i * kRowHeight,
                        tomorrow_events[i]);
           }
+          for (int i = 0; i < day_after_tomorrow_shown; i++, slot++) {
+            show_event(slot, day_after_tomorrow_rows_top + i * kRowHeight,
+                       day_after_tomorrow_events[i]);
+          }
 
           // A row cannot draw outside its own box, so the piece of rail between
           // the panel edge and the first row is a separate segment.
@@ -879,6 +951,11 @@ script:
           if (tomorrow_shown > 0) {
             lv_obj_set_height(rail_lines[today_shown + tomorrow_shown - 1],
                               kRailDotCentre);
+          }
+          if (day_after_tomorrow_shown > 0) {
+            lv_obj_set_height(
+              rail_lines[today_shown + tomorrow_shown + day_after_tomorrow_shown - 1],
+              kRailDotCentre);
           }
       # Decide whether this render is worth a refresh. Walking the widget tree
       # rather than listing every label means a new widget cannot be forgotten
@@ -976,7 +1053,7 @@ interval:
             start_date_time: >-
               {{ now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() }}
             end_date_time: >-
-              {{ (now() + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat() }}
+              {{ (now() + timedelta(days=2)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat() }}
           capture_response: true
           on_success:
             - lambda: |-
@@ -1165,7 +1242,7 @@ font:
           "\U000F0A79", # mdi-trash-can, waste collection
           "\U000F00ED", # mdi-calendar, any calendar without its own icon
         ]
-  # Compact calendar titles: seven two-line events plus two day headers fit
+  # Compact calendar titles: seven two-line events plus the day headers fit
   # inside the full-height right panel.
   - file: "gfonts://Inter@400"
     id: font_calendar
@@ -1196,6 +1273,7 @@ font:
           "\U000F096B", # mdi-fountain
           "\U000F07AC", # mdi-car-sports, F1 race week
           "\U000F072A", # mdi-washing-machine
+          "\U000F10C2", # mdi-thermometer-high, automatic curtain operation
         ]
   # Status value under the icon of a permanent notification. Only ever holds a
   # short word or a count, so it can be large enough to read across the room
@@ -1934,7 +2012,8 @@ lvgl:
                         text: ""
 
         # Calendar. The right panel is one chronological agenda: remaining
-        # events for today first, followed by tomorrow's events.
+        # events for today first, followed by tomorrow's and, space permitting,
+        # the day after's.
         - obj:
             id: panel_calendar
             x: 400
@@ -2537,6 +2616,65 @@ lvgl:
                   hidden: true
                   x: 0
                   y: 90
+                  width: 100%
+                  height: 58
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_top: 15
+                  pad_bottom: 15
+                  pad_left: 0
+                  pad_right: 0
+                  scrollable: false
+                  layout:
+                    type: flex
+                    flex_flow: COLUMN
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                    pad_row: 0
+                  widgets:
+                    - label:
+                        width: 100%
+                        text_align: CENTER
+                        text_font: font_small
+                        text_color: paper_black
+                        text: "Nothing planned"
+              - obj:
+                  id: cal_day_after_tomorrow_header
+                  hidden: true
+                  x: 0
+                  y: 0
+                  width: 100%
+                  height: 32
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  widgets:
+                    - label:
+                        id: cal_day_after_tomorrow_header_text
+                        x: 0
+                        y: 0
+                        width: 100%
+                        height: 28
+                        text_align: CENTER
+                        text_font: font_header
+                        text_color: paper_black
+                        text: ""
+                    - obj:
+                        x: 12
+                        y: 30
+                        width: 368
+                        height: 2
+                        bg_color: paper_black
+                        bg_opa: COVER
+                        border_width: 0
+                        radius: 0
+                        pad_all: 0
+              - obj:
+                  id: cal_day_after_tomorrow_empty
+                  hidden: true
+                  x: 0
+                  y: 0
                   width: 100%
                   height: 58
                   bg_opa: TRANSP
