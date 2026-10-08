@@ -698,6 +698,8 @@ script:
           constexpr int kRailDotCentre = 13;     // row top to the middle of the dot
           constexpr int kCalendarHeight = 464;   // cal_events height
           constexpr int kMaxEventsBeforeDayAfterTomorrow = 5;
+          lv_color_t paper = lv_color_hex(0x000000);
+          lv_color_t ink = lv_color_hex(0xFFFFFF);
           lv_obj_t *slots[kSlots] = {
             id(cal_slot_1), id(cal_slot_2), id(cal_slot_3),
             id(cal_slot_4), id(cal_slot_5), id(cal_slot_6), id(cal_slot_7),
@@ -915,6 +917,14 @@ script:
             }
             lv_label_set_text(time_labels[slot], when.c_str());
             lv_label_set_text(title_labels[slot], event->summary.c_str());
+            // Waste collection means putting a bin out, so it inverts like the
+            // actionable notifications. Slots are reused, so reset the others.
+            const bool is_waste = event->cal_name == "waste";
+            lv_obj_set_style_bg_opa(title_labels[slot],
+                                    is_waste ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(title_labels[slot], ink, LV_PART_MAIN);
+            lv_obj_set_style_text_color(title_labels[slot], is_waste ? paper : ink, LV_PART_MAIN);
+            lv_obj_set_style_pad_left(title_labels[slot], is_waste ? 5 : 0, LV_PART_MAIN);
             lv_obj_set_y(slots[slot], y);
             lv_obj_set_height(rail_lines[slot], lv_pct(100));
             lv_obj_remove_flag(rails[slot], LV_OBJ_FLAG_HIDDEN);
