@@ -125,6 +125,10 @@ text_sensor:
   - platform: ethernet_info
     ip_address:
       name: Ethernet IP Address
+  # Uncomment together with the wifi_network package below
+  # - platform: wifi_info
+  #   ip_address:
+  #     name: WiFi IP Address
 
 # ===== Packages =====
 # Updating the esparagus_remote pin:
