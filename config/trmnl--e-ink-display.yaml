@@ -174,6 +174,14 @@ text_sensor:
                   id: printer_done
                   value: 'true'
               - script.execute: clear_printer_done
+        - if:
+            condition:
+              lambda: 'return x == "printing";'
+            then:
+              - script.stop: clear_printer_done
+              - globals.set:
+                  id: printer_done
+                  value: 'false'
         - script.execute: request_dashboard_update
 
 binary_sensor:
@@ -268,14 +276,6 @@ sensor:
       - delta: 0.001
     on_value:
       then:
-        - if:
-            condition:
-              lambda: 'return id(printer_done) && x > 0 && x < 100;'
-            then:
-              - script.stop: clear_printer_done
-              - globals.set:
-                  id: printer_done
-                  value: 'false'
         - script.execute: request_dashboard_update
   # Counts down while a programme runs, in hours as a fraction, so 1.75 means
   # one hour and forty-five minutes. Unavailable whenever the machine is not
@@ -650,9 +650,8 @@ script:
           }
           if (id(printer_done)) {
             actionable[actionable_count++] = "\U000F0E5B 3D printer: done";
-          } else if (!isnan(id(printer_progress).state) &&
-              id(printer_progress).state > 0 &&
-              id(printer_progress).state < 100) {
+          } else if (id(printer_state).state == "printing" &&
+                     !isnan(id(printer_progress).state)) {
             char printing[32];
             snprintf(printing, sizeof(printing), "\U000F0E5B Printing %0.0f%%",
                      id(printer_progress).state);
