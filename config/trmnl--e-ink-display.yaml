@@ -159,6 +159,23 @@ text_sensor:
       then:
         - script.execute: request_dashboard_update
 
+  - platform: homeassistant
+    entity_id: sensor.k1c_ef19_current_print_state
+    name: "Printer state"
+    id: printer_state
+    filters: *only_on_change
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "complete";'
+            then:
+              - globals.set:
+                  id: printer_done
+                  value: 'true'
+              - script.execute: clear_printer_done
+        - script.execute: request_dashboard_update
+
 binary_sensor:
   # Feeds the layout switch below: dashboard while someone is in the kitchen,
   # full-screen clock when the room is empty. A real binary_sensor rather than
@@ -251,6 +268,14 @@ sensor:
       - delta: 0.001
     on_value:
       then:
+        - if:
+            condition:
+              lambda: 'return id(printer_done) && x > 0 && x < 100;'
+            then:
+              - script.stop: clear_printer_done
+              - globals.set:
+                  id: printer_done
+                  value: 'false'
         - script.execute: request_dashboard_update
   # Counts down while a programme runs, in hours as a fraction, so 1.75 means
   # one hour and forty-five minutes. Unavailable whenever the machine is not
@@ -363,6 +388,11 @@ globals:
     restore_value: false
     initial_value: 'true'
 
+  - id: printer_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
 script:
   # Turn the divider on just long enough to take a stable ADC reading
   - id: sample_battery
@@ -384,6 +414,16 @@ script:
     then:
       - delay: 3s
       - script.execute: update_dashboard
+
+  # Restart mode so a second "complete" in a row gets its own full half hour.
+  - id: clear_printer_done
+    mode: restart
+    then:
+      - delay: 30min
+      - globals.set:
+          id: printer_done
+          value: 'false'
+      - script.execute: request_dashboard_update
 
   - id: update_dashboard
     mode: single
@@ -608,7 +648,9 @@ script:
               id(vacuum_runs_without_cleaning).state > 1) {
             actionable[actionable_count++] = "\U000F070D Clean vacuum";
           }
-          if (!isnan(id(printer_progress).state) &&
+          if (id(printer_done)) {
+            actionable[actionable_count++] = "\U000F0E5B 3D printer: done";
+          } else if (!isnan(id(printer_progress).state) &&
               id(printer_progress).state > 0 &&
               id(printer_progress).state < 100) {
             char printing[32];
