@@ -22,7 +22,7 @@ api:
 
 ota:
   - platform: esphome
-    password: !secret otapwd_office_background_lamp
+    encryption:
 
 output:
   - platform: gpio
