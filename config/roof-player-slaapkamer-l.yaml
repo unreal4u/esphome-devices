@@ -9,7 +9,7 @@
 
 substitutions:
   name: roof-player-slaapkamer-l
-  friendly_name: Roof player slaapkamer L
+  friendly_name: Ceiling player slaapkamer L
   device_friendly_name: ${friendly_name}
   task_stack_in_psram: "true"
 
