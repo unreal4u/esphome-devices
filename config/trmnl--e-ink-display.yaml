@@ -238,7 +238,8 @@ sensor:
   - platform: homeassistant
     id: outside_temperature
     name: "Outside Temperature"
-    entity_id: sensor.buienradar_temperature
+    entity_id: weather.buienradar
+    attribute: temperature
   - platform: homeassistant
     entity_id: sensor.temperature_downstairs
     name: "Downstairs temperature"
