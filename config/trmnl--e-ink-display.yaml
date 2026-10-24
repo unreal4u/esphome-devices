@@ -603,8 +603,8 @@ script:
           lv_label_set_text(id(perm_lights_status), lights_text);
           lv_label_set_text(id(lbl_clock_lights_status), lights_text);
 
-          const std::string &season = id(season).state;
-          if (season == "autumn" || season == "winter") {
+          const std::string &current_season = id(season).state;
+          if (current_season == "autumn" || current_season == "winter") {
             lv_label_set_text(id(perm_cv_icon),
                               id(cv_heating).state ? "\U000F0438" : "\U000F0AD7");
             // Clamped to a day so a nonsense reading cannot overrun the buffer.
