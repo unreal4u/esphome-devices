@@ -184,6 +184,16 @@ text_sensor:
                   value: 'false'
         - script.execute: request_dashboard_update
 
+  # Season integration: spring, summer, autumn or winter.
+  - platform: homeassistant
+    entity_id: sensor.season
+    name: "Season"
+    id: season
+    filters: *only_on_change
+    on_value:
+      then:
+        - script.execute: request_dashboard_update
+
 binary_sensor:
   # Feeds the layout switch below: dashboard while someone is in the kitchen,
   # full-screen clock when the room is empty. A real binary_sensor rather than
@@ -211,6 +221,13 @@ binary_sensor:
                 id(full_screen_clock).turn_off();
               }
             }
+  - platform: homeassistant
+    entity_id: binary_sensor.onoff_heating
+    name: "CV heating"
+    id: cv_heating
+    on_state:
+      then:
+        - script.execute: request_dashboard_update
 
 switch:
   # Which layout is on screen, as a handle Home Assistant can both read and
@@ -268,6 +285,15 @@ sensor:
     on_value:
       then:
         - script.execute: request_dashboard_update
+  # Hours the CV has been heating today, as a fraction like the washing machine
+  # sensors below. No on_value refresh for the same reason as those: it ticks
+  # every minute while heating and the per-minute redraw already picks it up.
+  - platform: homeassistant
+    entity_id: sensor.cv_verwarmingstijd
+    name: "CV heating time today"
+    id: cv_heating_time
+    filters:
+      - delta: 0.0166
   - platform: homeassistant
     entity_id: sensor.k1c_ef19_progress
     name: "Printer progress"
@@ -347,20 +373,6 @@ sensor:
       - clamp:
           min_value: 0
           max_value: 100
-    on_value:
-      then:
-        # The strip shows a whole percentage below 90%, so refresh when that
-        # number changes and when the slot appears or clears. -1 means hidden.
-        - if:
-            condition:
-              lambda: |-
-                static int last_shown = -1;
-                int shown = (!isnan(x) && x < 90.0f) ? (int) roundf(x) : -1;
-                bool changed = shown != last_shown;
-                last_shown = shown;
-                return changed;
-            then:
-              - script.execute: request_dashboard_update
 
 # GPIO6 gates the battery voltage divider; leave it off between samples
 output:
@@ -591,36 +603,26 @@ script:
           lv_label_set_text(id(perm_lights_status), lights_text);
           lv_label_set_text(id(lbl_clock_lights_status), lights_text);
 
-          // Battery only earns a permanent slot once it is worth acting on.
-          // The icon steps with the charge so the strip reads at a glance.
-          const float battery = id(battery_level).state;
-          if (!isnan(battery) && battery < 90.0f) {
-            const int pct = (int) roundf(battery);
-            const char *battery_icon = "\U000F0083";  // alert, under 20%
-            if (pct >= 80) {
-              battery_icon = "\U000F0081";
-            } else if (pct >= 70) {
-              battery_icon = "\U000F0080";
-            } else if (pct >= 60) {
-              battery_icon = "\U000F007F";
-            } else if (pct >= 50) {
-              battery_icon = "\U000F007E";
-            } else if (pct >= 40) {
-              battery_icon = "\U000F007D";
-            } else if (pct >= 30) {
-              battery_icon = "\U000F007C";
-            } else if (pct >= 20) {
-              battery_icon = "\U000F007B";
+          const std::string &season = id(season).state;
+          if (season == "autumn" || season == "winter") {
+            lv_label_set_text(id(perm_cv_icon),
+                              id(cv_heating).state ? "\U000F0438" : "\U000F0AD7");
+            // Clamped to a day so a nonsense reading cannot overrun the buffer.
+            int cv_minutes = isnan(id(cv_heating_time).state)
+              ? 0 : (int) lroundf(id(cv_heating_time).state * 60.0f);
+            if (cv_minutes < 0) {
+              cv_minutes = 0;
+            } else if (cv_minutes > 24 * 60) {
+              cv_minutes = 24 * 60;
             }
-            char battery_text[8];
-            snprintf(battery_text, sizeof(battery_text), "%d%%", pct);
-            lv_label_set_text(id(perm_battery_icon), battery_icon);
-            lv_label_set_text(id(perm_battery_status), battery_text);
-            lv_obj_remove_flag(id(perm_battery), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(id(perm_battery_rule), LV_OBJ_FLAG_HIDDEN);
+            char cv_text[8];
+            snprintf(cv_text, sizeof(cv_text), "%d:%02d", cv_minutes / 60, cv_minutes % 60);
+            lv_label_set_text(id(perm_cv_status), cv_text);
+            lv_obj_remove_flag(id(perm_cv), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(id(perm_cv_rule), LV_OBJ_FLAG_HIDDEN);
           } else {
-            lv_obj_add_flag(id(perm_battery), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(perm_battery_rule), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(perm_cv), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(perm_cv_rule), LV_OBJ_FLAG_HIDDEN);
           }
 
           lv_obj_t *notification_labels[8] = {
@@ -1334,7 +1336,7 @@ font:
     id: font_status
     size: 24
     bpp: 1
-    glyphs: "Low€0123456789%"
+    glyphs: "Low€0123456789:"
   # Only ever holds the count of lights that are on, so it carries digits alone
   # and can be sized purely for legibility across the room.
   - file: "gfonts://Inter@700"
@@ -1344,7 +1346,7 @@ font:
     glyphs: "0123456789"
   # Icons on the always-on strip. The strip only ever stacks three of these, so
   # they get far more room than the feed icons and are sized to read at a glance
-  # from across the room. The battery variants track the charge level.
+  # from across the room.
   - file: "fonts/materialdesignicons-webfont.ttf"
     id: font_perm_icon
     size: 56
@@ -1353,14 +1355,8 @@ font:
       "\U000F0D3E", # mdi-transmission-tower
       "\U000F06E8", # mdi-lightbulb-on
       "\U000F00ED", # mdi-calendar, today's remaining events
-      "\U000F0083", # mdi-battery-alert, below 20%
-      "\U000F007B", # mdi-battery-20
-      "\U000F007C", # mdi-battery-30
-      "\U000F007D", # mdi-battery-40
-      "\U000F007E", # mdi-battery-50
-      "\U000F007F", # mdi-battery-60
-      "\U000F0080", # mdi-battery-70
-      "\U000F0081", # mdi-battery-80
+      "\U000F0438", # mdi-radiator, CV heating
+      "\U000F0AD7", # mdi-radiator-disabled, CV idle
     ]
   # Start/end times of calendar events
   - file: "gfonts://Inter@400"
@@ -1925,7 +1921,7 @@ lvgl:
                   border_width: 0
                   radius: 0
                   pad_all: 0
-              # Always-on strip: tariff, then lights, then battery. Three equal
+              # Always-on strip: tariff, then lights, then CV. Three equal
               # 104px slots, so each icon gets the full width of the strip.
               # Starts at 306 where the rule above ends, so the inverted tariff
               # block butts straight onto it with no white sliver between.
@@ -2012,10 +2008,10 @@ lvgl:
                   border_width: 0
                   radius: 0
                   pad_all: 0
-              # Hidden together with the battery slot below it, otherwise a
-              # healthy battery leaves a rule with nothing under it.
+              # Hidden together with the CV slot below it, otherwise spring
+              # and summer leave a rule with nothing under it.
               - obj:
-                  id: perm_battery_rule
+                  id: perm_cv_rule
                   x: 304
                   y: 210
                   width: 100
@@ -2026,10 +2022,9 @@ lvgl:
                   border_width: 0
                   radius: 0
                   pad_all: 0
-              # Hidden while the pack is above 90%, so a healthy battery does
-              # not permanently occupy the bottom of the strip.
+              # Only shown in autumn and winter, when the heating is in use.
               - obj:
-                  id: perm_battery
+                  id: perm_cv
                   x: 306
                   y: 212
                   width: 90
@@ -2042,7 +2037,7 @@ lvgl:
                   scrollable: false
                   widgets:
                     - label:
-                        id: perm_battery_icon
+                        id: perm_cv_icon
                         x: 0
                         y: 2
                         width: 100%
@@ -2050,9 +2045,9 @@ lvgl:
                         text_align: CENTER
                         text_font: font_perm_icon
                         text_color: paper_black
-                        text: "\U000F0081"
+                        text: "\U000F0AD7"
                     - label:
-                        id: perm_battery_status
+                        id: perm_cv_status
                         x: 0
                         y: 66
                         width: 100%
