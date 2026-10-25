@@ -1,0 +1,26 @@
+substitutions:
+  device_name: t-encoder-pro
+  device_friendly_name: T-Encoder Pro
+  device_comment: LilyGO T-Encoder Pro rotary controller
+
+packages:
+  basics: !include .basics.yaml
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret t_encoder_pro__encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret t_encoder_pro__ota_password
