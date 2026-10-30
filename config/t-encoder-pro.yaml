@@ -2,9 +2,104 @@ substitutions:
   device_name: t-encoder-pro
   device_friendly_name: T-Encoder Pro
   device_comment: LilyGO T-Encoder Pro rotary controller
+  # Swipe order; turning the knob on the clock controls the first one
+  entities: >-
+    media_player.roof_slaapkamer,
+    light.shellyvintage_98cdac1df45d,
+    light.white_spectrum_night_stand,
+    light.mini1g3_slaapkamer_main_lights,
+    light.presence_detection_slaapkamer_breaker_status
+  keep_screen_on_entity: light.mini1g3_slaapkamer_main_lights
 
 packages:
   basics: !include .basics.yaml
+
+esphome:
+  on_boot:
+    # Subscriptions must exist before Home Assistant connects and asks for them
+    - priority: 800
+      then:
+        - lambda: |-
+            std::string list = "${entities}";
+            size_t start = 0;
+            while (start < list.size()) {
+              size_t end = std::min(list.find(',', start), list.size());
+              std::string entity = list.substr(start, end - start);
+              entity.erase(0, entity.find_first_not_of(' '));
+              entity.erase(entity.find_last_not_of(' ') + 1);
+              start = end + 1;
+              if (str_startswith(entity, "light.") || str_startswith(entity, "media_player.")) {
+                id(entity_ids).push_back(entity);
+              } else if (!entity.empty()) {
+                ESP_LOGE("entities", "Skipping %s: only lights and media players are supported", entity.c_str());
+              }
+            }
+            id(entity_attributes).resize(id(entity_ids).size());
+
+            for (int i = 0; i < id(entity_ids).size(); i++) {
+              std::string entity = id(entity_ids)[i];
+              std::vector<std::string> attributes = {"friendly_name", "icon"};
+              if (str_startswith(entity, "media_player.")) {
+                attributes.insert(attributes.end(), {"device_class", "volume_level", "entity_picture"});
+              } else {
+                attributes.insert(attributes.end(), {"supported_color_modes", "color_mode", "brightness",
+                                                     "color_temp_kelvin", "min_color_temp_kelvin",
+                                                     "max_color_temp_kelvin", "hs_color"});
+              }
+              auto subscribe = [i, entity](optional<std::string> attribute) {
+                std::string key = attribute.value_or("state");
+                api::global_api_server->subscribe_home_assistant_state(entity, attribute, [i, entity, key](StringRef value) {
+                  ESP_LOGD("entities", "'%s' %s: '%s'", entity.c_str(), key.c_str(), value.c_str());
+                  if (key == "icon" && id(icon_glyphs).count(value.str()) == 0) {
+                    ESP_LOGW("entities", "'%s' uses %s, which is not in the icon font: showing the default icon",
+                             entity.c_str(), value.c_str());
+                  }
+                  id(entity_attributes)[i][key] = value.str();
+                  id(entity_updated)->execute(i, key);
+                });
+              };
+              subscribe({});
+              for (auto &attribute : attributes) {
+                subscribe(attribute);
+              }
+            }
+    - priority: -100
+      then:
+        - lambda: |-
+            for (int i = 0; i <= id(entity_ids).size(); i++) {
+              lv_obj_t *dot = lv_obj_create(id(page_dots));
+              lv_obj_set_size(dot, 8, 8);
+              lv_obj_set_pos(dot, i * 16, 0);
+              lv_obj_set_style_radius(dot, 4, LV_PART_MAIN);
+              lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
+              lv_obj_set_style_bg_color(dot, lv_color_hex(0x505050), LV_PART_MAIN);
+              lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+            }
+
+            // Device page, colour temperature, colour
+            for (int i = 0; i < 3; i++) {
+              lv_obj_t *dot = lv_obj_create(id(tune_dots));
+              lv_obj_set_size(dot, 8, 8);
+              lv_obj_set_pos(dot, 0, i * 16);
+              lv_obj_set_style_radius(dot, 4, LV_PART_MAIN);
+              lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
+              lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+            }
+
+            // Thin slices of the 8 to 4 o'clock arc, recoloured into a gradient per light
+            const int slices = 48;
+            for (int i = 0; i < slices; i++) {
+              lv_obj_t *slice = lv_arc_create(id(tune_gradient));
+              lv_obj_set_size(slice, 390, 390);
+              lv_obj_center(slice);
+              lv_arc_set_bg_angles(slice, (150 + i * 240 / slices) % 360, (150 + (i + 1) * 240 / slices) % 360);
+              lv_obj_set_style_arc_width(slice, 14, LV_PART_MAIN);
+              lv_obj_set_style_arc_rounded(slice, false, LV_PART_MAIN);
+              lv_obj_set_style_arc_opa(slice, LV_OPA_TRANSP, LV_PART_INDICATOR);
+              lv_obj_set_style_bg_opa(slice, LV_OPA_TRANSP, LV_PART_KNOB);
+              lv_obj_remove_flag(slice, LV_OBJ_FLAG_CLICKABLE);
+            }
+        - script.execute: screen_timeout_timer
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -20,7 +115,1345 @@ psram:
 api:
   encryption:
     key: !secret t_encoder_pro__encryption_key
+  homeassistant_states: true
 
 ota:
   - platform: esphome
-    password: !secret t_encoder_pro__ota_password
+    encryption:
+
+logger:
+  logs:
+    display.mipi_spi: INFO
+
+sensor:
+  - platform: rotary_encoder
+    name: "Knob"
+    id: knob
+    pin_a:
+      number: GPIO1
+      mode: INPUT_PULLUP
+    pin_b:
+      number: GPIO2
+      mode: INPUT_PULLUP
+    resolution: 2
+    on_value:
+      - script.execute: click
+    on_clockwise:
+      - script.execute:
+          id: knob_turned
+          steps: 1
+    on_anticlockwise:
+      - script.execute:
+          id: knob_turned
+          steps: -1
+
+text_sensor:
+  - platform: homeassistant
+    id: keep_screen_on_state
+    entity_id: ${keep_screen_on_entity}
+    internal: true
+    on_value:
+      - if:
+          condition:
+            lambda: return x == "on";
+          then:
+            - if:
+                condition:
+                  or:
+                    - lvgl.is_paused:
+                    - script.is_running: screen_off
+                then:
+                  - script.execute: screen_on
+            - script.stop: screen_timeout_timer
+          else:
+            - if:
+                condition:
+                  lambda: return id(selected_device) == -1;
+                then:
+                  - script.execute: screen_timeout_timer
+
+binary_sensor:
+  - platform: gpio
+    name: "Knob button"
+    id: knob_button
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+      ignore_strapping_warning: true
+    filters:
+      - delayed_on_off: 10ms
+    on_press:
+      - script.execute: click
+      - script.execute: knob_pressed
+
+globals:
+  - id: entity_ids
+    type: std::vector<std::string>
+  # Per entity: attribute name ("state" for the state itself) to the value Home Assistant last sent
+  - id: entity_attributes
+    type: std::vector<std::map<std::string, std::string>>
+  # -1 means the clock is showing, otherwise an index into entity_ids
+  - id: selected_device
+    type: int
+    initial_value: "-1"
+  - id: selected_device_available
+    type: bool
+    initial_value: "false"
+  - id: selected_device_name
+    type: std::string
+  - id: selected_is_media_player
+    type: bool
+    initial_value: "false"
+  - id: selected_device_has_level
+    type: bool
+    initial_value: "false"
+  - id: selected_device_on
+    type: bool
+    initial_value: "false"
+  - id: selected_supports_color_temp
+    type: bool
+    initial_value: "false"
+  - id: selected_supports_hue
+    type: bool
+    initial_value: "false"
+  - id: selected_color_mode
+    type: std::string
+  - id: selected_icon
+    type: std::string
+  # Artwork URLs carry an access token that Home Assistant rotates, so the cache key identifies the artwork
+  - id: artwork_key
+    type: std::string
+  - id: artwork_ready
+    type: bool
+    initial_value: "false"
+  # Every icon here must also be in the glyphs of the mdi_large font
+  - id: icon_glyphs
+    type: std::map<std::string, std::string>
+    initial_value: >-
+      {
+        {"mdi:audio-video", "\U000F093D"},
+        {"mdi:bed", "\U000F02E3"},
+        {"mdi:cast", "\U000F0118"},
+        {"mdi:floor-lamp-torchiere", "\U000F1747"},
+        {"mdi:lamp", "\U000F06B5"},
+        {"mdi:led-strip", "\U000F07D6"},
+        {"mdi:led-strip-variant", "\U000F1051"},
+        {"mdi:lightbulb", "\U000F0335"},
+        {"mdi:lightbulb-spot", "\U000F17F4"},
+        {"mdi:lightbulb-variant", "\U000F1802"},
+        {"mdi:play-circle", "\U000F040C"},
+        {"mdi:speaker", "\U000F04C3"},
+        {"mdi:speaker-multiple", "\U000F0D38"},
+        {"mdi:television", "\U000F0502"},
+      }
+  # Volume or brightness (0-1) of the selected device, NAN while unknown
+  - id: level
+    type: float
+    initial_value: "NAN"
+  - id: level_device
+    type: int
+    initial_value: "-1"
+  - id: color_temp
+    type: float
+    initial_value: "NAN"
+  - id: min_color_temp
+    type: float
+    initial_value: "2000"
+  - id: max_color_temp
+    type: float
+    initial_value: "6500"
+  - id: hue
+    type: float
+    initial_value: "NAN"
+  - id: saturation
+    type: float
+    initial_value: "100"
+  # 0 = not tuning, 1 = colour temperature, 2 = colour
+  - id: tune_mode
+    type: int
+    initial_value: "0"
+  - id: tune_send_mode
+    type: int
+    initial_value: "0"
+  - id: tune_device
+    type: int
+    initial_value: "-1"
+  - id: knob_steps
+    type: int
+    initial_value: "0"
+  - id: last_knob_turn_ms
+    type: uint32_t
+    initial_value: "0"
+
+output:
+  - platform: ledc
+    pin: GPIO17
+    id: buzzer
+    frequency: 2000Hz
+
+script:
+  - id: click
+    mode: restart
+    then:
+      # Passive buzzer peaks at 50% duty: slider 0-100% maps to 0-50%
+      - output.set_level:
+          id: buzzer
+          level: !lambda return id(click_volume).state / 200.0f;
+      - delay: 15ms
+      - output.turn_off: buzzer
+
+  - id: screen_on
+    then:
+      - script.stop: screen_off
+      - script.execute: screen_timeout_timer
+      - lvgl.resume:
+      - script.execute: update_clock
+      - lvgl.widget.redraw:
+      # The panel keeps showing its last frame until LVGL has pushed a fresh one
+      - delay: 100ms
+      - lambda: id(amoled).set_brightness(id(screen_brightness).state * 255 / 100);
+
+  - id: screen_off
+    mode: restart
+    then:
+      - repeat:
+          count: 50
+          then:
+            - lambda: |-
+                float level = id(screen_brightness).state * 255 / 100;
+                id(amoled).set_brightness(level * (49 - iteration) / 50);
+            - delay: 100ms
+      - lvgl.pause:
+
+  - id: screen_timeout_timer
+    mode: restart
+    then:
+      - delay: !lambda return id(screen_timeout).state * 1000;
+      - if:
+          condition:
+            lambda: return id(keep_screen_on_state).state != "on";
+          then:
+            - script.execute: screen_off
+
+  - id: entity_updated
+    mode: queued
+    parameters:
+      index: int
+      attribute: string
+    then:
+      - if:
+          condition:
+            lambda: return attribute == "state" && str_startswith(id(entity_ids)[index], "media_player.");
+          then:
+            - script.execute: update_playing_icon
+      - if:
+          condition:
+            lambda: return index == id(selected_device);
+          then:
+            - script.execute: refresh_device_page
+
+  - id: update_playing_icon
+    then:
+      - if:
+          condition:
+            lambda: |-
+              for (int i = 0; i < id(entity_ids).size(); i++) {
+                if (str_startswith(id(entity_ids)[i], "media_player.") && id(entity_attributes)[i]["state"] == "playing") {
+                  return true;
+                }
+              }
+              return false;
+          then:
+            - lvgl.widget.show: playing_icon
+          else:
+            - lvgl.widget.hide: playing_icon
+
+  - id: show_clock
+    then:
+      - lambda: id(selected_device) = -1;
+      - script.execute:
+          id: change_page
+          tune: false
+
+  # Dips the backlight around a page switch so pages do not change abruptly. The page is picked
+  # from selected_device and tune_mode only once the screen is dark, so the latest input wins.
+  - id: change_page
+    mode: restart
+    parameters:
+      tune: bool
+    then:
+      - repeat:
+          count: 5
+          then:
+            - lambda: id(amoled).set_brightness(id(screen_brightness).state * 255 / 100 * (4 - iteration) / 5);
+            - delay: 20ms
+      - if:
+          condition:
+            lambda: return tune;
+          then:
+            - script.execute: show_tune_page
+          else:
+            - script.execute: show_selected_page
+      - lambda: lv_refr_now(nullptr);
+      - repeat:
+          count: 5
+          then:
+            - lambda: id(amoled).set_brightness(id(screen_brightness).state * 255 / 100 * (iteration + 1) / 5);
+            - delay: 20ms
+
+  - id: show_selected_page
+    then:
+      - lambda: id(tune_mode) = 0;
+      - if:
+          condition:
+            lambda: return id(selected_device) == -1;
+          then:
+            - lvgl.page.show: clock_page
+            - lvgl.widget.hide: [page_dots, tune_dots]
+            - script.execute: screen_timeout_timer
+          else:
+            - script.execute: refresh_device_page
+            - lvgl.page.show: device_page
+            - lvgl.widget.show: page_dots
+            - script.stop: screen_timeout_timer
+      - lambda: |-
+          for (int i = 0; i < lv_obj_get_child_count(id(page_dots)); i++) {
+            bool current = i == id(selected_device) + 1;
+            lv_obj_set_style_bg_color(lv_obj_get_child(id(page_dots), i), lv_color_hex(current ? 0xFFFFFF : 0x505050),
+                                      LV_PART_MAIN);
+          }
+
+  - id: swiped
+    parameters:
+      direction: int
+    then:
+      - if:
+          condition:
+            not:
+              script.is_running: screen_off
+          then:
+            - lambda: |-
+                // Page 0 is the clock, pages 1..N are the devices; wrap around in both directions
+                int page_count = id(entity_ids).size() + 1;
+                int page = (id(selected_device) + 1 + direction + page_count) % page_count;
+                id(selected_device) = page - 1;
+            - script.execute:
+                id: change_page
+                tune: false
+
+  # Steps through the light's tuning screens: device page, colour temperature, colour
+  - id: swiped_down
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (id(tune_mode) < 1 && id(selected_supports_color_temp)) {
+                id(tune_mode) = 1;
+                return true;
+              }
+              if (id(tune_mode) < 2 && id(selected_supports_hue)) {
+                id(tune_mode) = 2;
+                return true;
+              }
+              return false;
+          then:
+            - script.execute:
+                id: change_page
+                tune: true
+
+  - id: show_tune_page
+    then:
+      - lambda: |-
+          lv_obj_t *gradient = id(tune_gradient);
+          int slices = lv_obj_get_child_count(gradient);
+          for (int i = 0; i < slices; i++) {
+            float position = (i + 0.5f) / slices;
+            lv_color_t color;
+            if (id(tune_mode) == 1) {
+              float kelvin = id(min_color_temp) + position * (id(max_color_temp) - id(min_color_temp));
+              color = lv_color_mix(lv_color_hex(0xFF8B14), lv_color_hex(0xD6E4FF), 255 * clamp((6500 - kelvin) / 4500, 0.0f, 1.0f));
+            } else {
+              color = lv_color_hsv_to_rgb(position * 360, 100, 100);
+            }
+            lv_obj_set_style_arc_color(lv_obj_get_child(gradient, i), color, LV_PART_MAIN);
+          }
+      # Setting the text restarts the scroll animation, and refreshes run every second
+      - lambda: |-
+          if (id(selected_device_name) != lv_label_get_text(id(tune_name))) {
+            lv_label_set_text(id(tune_name), id(selected_device_name).c_str());
+          }
+      - lvgl.label.update:
+          id: tune_icon
+          text: !lambda return id(selected_icon);
+      - script.execute: update_tune_page
+      - script.execute: update_tune_dots
+      - lvgl.widget.hide: page_dots
+      - lvgl.page.show: tune_page
+
+  - id: update_tune_dots
+    then:
+      - lambda: |-
+          bool pages[] = {true, id(selected_supports_color_temp), id(selected_supports_hue)};
+          int page_count = 0;
+          for (int i = 0; i < 3; i++) {
+            lv_obj_t *dot = lv_obj_get_child(id(tune_dots), page_count);
+            if (pages[i]) {
+              lv_obj_set_style_bg_color(dot, lv_color_hex(i == id(tune_mode) ? 0xFFFFFF : 0x505050), LV_PART_MAIN);
+              page_count++;
+            }
+          }
+          for (int i = 0; i < 3; i++) {
+            if (i < page_count) {
+              lv_obj_remove_flag(lv_obj_get_child(id(tune_dots), i), LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_add_flag(lv_obj_get_child(id(tune_dots), i), LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+          if (page_count > 1 && id(selected_device_available)) {
+            lv_obj_remove_flag(id(tune_dots), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(tune_dots), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  - id: update_tune_page
+    then:
+      - lambda: |-
+          float position;
+          lv_color_t color;
+          if (id(tune_mode) == 1) {
+            float kelvin = std::isnan(id(color_temp)) ? (id(min_color_temp) + id(max_color_temp)) / 2 : id(color_temp);
+            position = (kelvin - id(min_color_temp)) / (id(max_color_temp) - id(min_color_temp));
+            color = lv_color_mix(lv_color_hex(0xFF8B14), lv_color_hex(0xD6E4FF), 255 * clamp((6500 - kelvin) / 4500, 0.0f, 1.0f));
+            lv_label_set_text(id(tune_label), std::isnan(id(color_temp)) ? "" : str_sprintf("%d K", (int) kelvin).c_str());
+          } else {
+            float current_hue = std::isnan(id(hue)) ? 0 : id(hue);
+            position = current_hue / 360;
+            color = lv_color_hsv_to_rgb(current_hue, id(saturation), 100);
+            lv_label_set_text(id(tune_label), "");
+          }
+          // The gradient starts at 150 degrees and spans 240; the marker sits inside it, pointing outwards
+          float degrees = 150 + 240 * clamp(position, 0.0f, 1.0f);
+          float radians = degrees * M_PI / 180;
+          lv_obj_align(id(tune_marker), LV_ALIGN_CENTER, 171 * cosf(radians), 171 * sinf(radians));
+          lv_obj_set_style_transform_rotation(id(tune_marker), (degrees + 90) * 10, LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(tune_icon), color, LV_PART_MAIN);
+          if (id(tune_mode) == 1 && id(selected_supports_hue)) {
+            lv_obj_remove_flag(id(tune_more_hint), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(tune_more_hint), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  - id: tune_to
+    parameters:
+      position: float
+    then:
+      - if:
+          condition:
+            lambda: return id(selected_device_available);
+          then:
+            - lambda: |-
+                if (id(tune_mode) == 1) {
+                  id(color_temp) = roundf(id(min_color_temp) + position * (id(max_color_temp) - id(min_color_temp)));
+                } else {
+                  id(hue) = position * 360;
+                }
+            - script.execute: apply_tune
+
+  - id: apply_tune
+    then:
+      - lambda: |-
+          id(tune_device) = id(selected_device);
+          id(tune_send_mode) = id(tune_mode);
+      - script.execute: update_tune_page
+      - script.execute: send_tune
+
+  - id: refresh_device_page
+    then:
+      - lambda: |-
+          int i = id(selected_device);
+          std::string entity = id(entity_ids)[i];
+          auto &attributes = id(entity_attributes)[i];
+          auto attribute = [&](const char *key) {
+            auto it = attributes.find(key);
+            return it == attributes.end() ? std::string() : it->second;
+          };
+          // Home Assistant sends "None" for attributes that are unset, e.g. brightness of a light that is off
+          auto number = [&](const char *key) { return parse_number<float>(attribute(key)).value_or(NAN); };
+
+          std::string state = attribute("state");
+          id(selected_device_available) = api::global_api_server->is_connected() && !state.empty() &&
+                                          state != "unavailable" && state != "unknown";
+          id(selected_device_name) = attribute("friendly_name").empty() ? entity : attribute("friendly_name");
+          id(selected_is_media_player) = str_startswith(entity, "media_player.");
+          id(selected_device_on) = state == "on";
+
+          // Home Assistant never combines onoff with other colour modes
+          std::string modes = attribute("supported_color_modes");
+          bool dimmable = !modes.empty() && modes.find("onoff") == std::string::npos && modes.find("unknown") == std::string::npos;
+          id(selected_supports_color_temp) = modes.find("color_temp") != std::string::npos;
+          id(selected_supports_hue) = modes.find("hs") != std::string::npos || modes.find("rgb") != std::string::npos ||
+                                      modes.find("xy") != std::string::npos;
+          id(selected_color_mode) = attribute("color_mode");
+          id(selected_device_has_level) = id(selected_is_media_player) || dimmable;
+
+          // Same fallbacks as the Home Assistant frontend when an entity has no icon of its own
+          std::string icon = attribute("icon");
+          if (id(icon_glyphs).count(icon) == 0) {
+            std::string device_class = attribute("device_class");
+            icon = !id(selected_is_media_player)  ? "mdi:lightbulb"
+                 : device_class == "speaker"      ? "mdi:speaker"
+                 : device_class == "tv"           ? "mdi:television"
+                 : device_class == "receiver"     ? "mdi:audio-video"
+                                                  : "mdi:cast";
+          }
+          id(selected_icon) = id(icon_glyphs)[icon];
+
+          bool off = state == "off" || state == "standby";
+          uint32_t icon_color = !id(selected_device_available) ? 0x505050
+                              : off                            ? 0x808080
+                              : id(selected_is_media_player)   ? 0xFFFFFF
+                                                               : 0xFFC107;
+          lv_obj_set_style_text_color(id(device_icon), lv_color_hex(icon_color), LV_PART_MAIN);
+          if (id(selected_device_available) && (id(selected_supports_color_temp) || id(selected_supports_hue))) {
+            lv_obj_remove_flag(id(more_hint), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(more_hint), LV_OBJ_FLAG_HIDDEN);
+          }
+
+          // While our own change is still in flight, Home Assistant reports the old value
+          bool sending_level = id(send_level).is_running() && id(level_device) == i;
+          if (id(selected_device_has_level) && !sending_level) {
+            id(level) = id(selected_is_media_player) ? number("volume_level")
+                      : state == "off"               ? 0.0f
+                                                     : number("brightness") / 255;
+          }
+
+          bool sending_tune = id(send_tune).is_running() && id(tune_device) == i;
+          if (!sending_tune) {
+            id(min_color_temp) = std::isnan(number("min_color_temp_kelvin")) ? 2000 : number("min_color_temp_kelvin");
+            id(max_color_temp) = std::isnan(number("max_color_temp_kelvin")) ? 6500 : number("max_color_temp_kelvin");
+            id(color_temp) = number("color_temp_kelvin");
+            float hs_hue, hs_saturation;
+            if (sscanf(attribute("hs_color").c_str(), "(%f, %f)", &hs_hue, &hs_saturation) == 2) {
+              id(hue) = hs_hue;
+              id(saturation) = hs_saturation;
+            } else {
+              id(hue) = NAN;
+              id(saturation) = 100;
+            }
+          }
+      - lvgl.label.update:
+          id: device_icon
+          text: !lambda return id(selected_icon);
+      # Setting the text restarts the scroll animation, and refreshes run every second
+      - lambda: |-
+          if (id(selected_device_name) != lv_label_get_text(id(device_name))) {
+            lv_label_set_text(id(device_name), id(selected_device_name).c_str());
+          }
+      - if:
+          condition:
+            lambda: return !id(selected_device_available);
+          then:
+            - lvgl.widget.show: unavailable_icon
+          else:
+            - lvgl.widget.hide: unavailable_icon
+      - if:
+          condition:
+            lambda: return id(selected_device_available) && id(selected_device_has_level) && !std::isnan(id(level));
+          then:
+            - script.execute: update_level_arc
+            - lvgl.widget.show: [level_arc, level_label]
+          else:
+            - lvgl.widget.hide: [level_arc, level_label]
+      - script.execute: update_tune_dots
+      - script.execute: update_artwork
+      - if:
+          condition:
+            lambda: return id(tune_mode) != 0;
+          then:
+            - script.execute: update_tune_page
+
+  - id: update_artwork
+    then:
+      - lambda: |-
+          auto &attributes = id(entity_attributes)[id(selected_device)];
+          std::string picture = attributes["entity_picture"];
+          bool wanted = id(selected_is_media_player) && id(selected_device_available) && attributes["state"] == "playing" &&
+                        str_startswith(picture, "/");
+          if (!wanted) {
+            lv_obj_add_flag(id(artwork_image), LV_OBJ_FLAG_HIDDEN);
+            return;
+          }
+          size_t cache = picture.find("cache=");
+          std::string key = cache == std::string::npos ? picture : picture.substr(cache);
+          if (key != id(artwork_key)) {
+            id(artwork_key) = key;
+            id(artwork_ready) = false;
+            lv_obj_add_flag(id(artwork_image), LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGD("artwork", "Asking Music Assistant for the artwork of %s", id(entity_ids)[id(selected_device)].c_str());
+            id(fetch_artwork).execute();
+          } else if (id(artwork_ready)) {
+            lv_obj_remove_flag(id(artwork_image), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  # Music Assistant can scale artwork down to 256px, which decodes about four times faster than the
+  # full size image behind entity_picture
+  - id: fetch_artwork
+    then:
+      - homeassistant.action:
+          action: music_assistant.get_queue
+          data:
+            entity_id: !lambda return id(entity_ids)[id(selected_device)];
+          capture_response: true
+          response_template: >-
+            {{ ((((response.values() | list | first).get('current_item') or {}).get('media_item') or {}).get('image') or '') | replace('size=0', 'size=256') }}
+          on_success:
+            - lambda: |-
+                std::string url = response["response"] | "";
+                if (!str_startswith(url, "http")) {
+                  ESP_LOGW("artwork", "Music Assistant has no artwork for the current item");
+                  return;
+                }
+                ESP_LOGD("artwork", "Downloading %s", url.c_str());
+                id(artwork)->set_url(url);
+                id(artwork)->update();
+          on_error:
+            - logger.log:
+                level: WARN
+                format: "Could not get the queue from Music Assistant: %s"
+                args: ["error.c_str()"]
+
+  - id: update_level_arc
+    then:
+      - lvgl.arc.update:
+          id: level_arc
+          value: !lambda return id(level) * 100;
+      - lvgl.label.update:
+          id: level_label
+          text: !lambda return str_sprintf("%d%%", (int) roundf(id(level) * 100));
+      - lambda: |-
+          if (!id(selected_is_media_player)) {
+            std::string mode = id(selected_color_mode);
+            lv_color_t color = lv_color_hex(0xFFC107);
+            if (mode == "color_temp" && !std::isnan(id(color_temp))) {
+              color = lv_color_mix(lv_color_hex(0xFF8B14), lv_color_hex(0xD6E4FF),
+                                   255 * clamp((6500 - id(color_temp)) / 4500, 0.0f, 1.0f));
+            } else if ((mode == "hs" || str_startswith(mode, "rgb") || mode == "xy") && !std::isnan(id(hue))) {
+              color = lv_color_hsv_to_rgb(id(hue), id(saturation), 100);
+            }
+            // The floor keeps a lamp on its lowest setting visibly coloured
+            float intensity = 0.25f + 0.75f * id(level);
+            lv_color_t shown = id(level) > 0 ? lv_color_mix(color, lv_color_black(), 255 * intensity) : lv_color_hex(0x808080);
+            lv_obj_set_style_text_color(id(device_icon), shown, LV_PART_MAIN);
+          }
+
+  - id: knob_turned
+    parameters:
+      steps: int
+    then:
+      - lambda: |-
+          // The knob is not an LVGL input, so it would not reset the idle timers otherwise
+          lv_display_trigger_activity(nullptr);
+          uint32_t now = millis();
+          uint32_t gap_ms = now - id(last_knob_turn_ms);
+          id(last_knob_turn_ms) = now;
+          int multiplier = gap_ms < 50 ? 4 : (gap_ms < 120 ? 2 : 1);
+          id(knob_steps) = steps * multiplier;
+      - if:
+          condition:
+            or:
+              - lvgl.is_paused:
+              - script.is_running: screen_off
+          then:
+            - script.execute: screen_on
+      - if:
+          condition:
+            lambda: return id(selected_device) == -1;
+          then:
+            - lambda: id(selected_device) = 0;
+            - script.execute: refresh_device_page
+            # Waking the screen already fades it in
+            - if:
+                condition:
+                  script.is_running: screen_on
+                then:
+                  - script.execute: show_selected_page
+                else:
+                  - script.execute:
+                      id: change_page
+                      tune: false
+          else:
+            - script.execute: refresh_device_page
+      - if:
+          condition:
+            lambda: return !id(selected_device_available);
+          then:
+            - logger.log:
+                level: WARN
+                format: "Ignoring knob: %s is unavailable"
+                args: ["id(entity_ids)[id(selected_device)].c_str()"]
+          else:
+            - if:
+                condition:
+                  lambda: return id(tune_mode) != 0;
+                then:
+                  - lambda: |-
+                      if (id(tune_mode) == 1) {
+                        float kelvin = std::isnan(id(color_temp)) ? (id(min_color_temp) + id(max_color_temp)) / 2 : id(color_temp);
+                        id(color_temp) = clamp(kelvin + id(knob_steps) * 100.0f, id(min_color_temp), id(max_color_temp));
+                      } else {
+                        float current_hue = std::isnan(id(hue)) ? 0 : id(hue);
+                        id(hue) = clamp(current_hue + id(knob_steps) * 5.0f, 0.0f, 360.0f);
+                      }
+                  - script.execute: apply_tune
+                else:
+                  - if:
+                      condition:
+                        lambda: return id(selected_device_has_level) && std::isnan(id(level));
+                      then:
+                        - logger.log:
+                            level: WARN
+                            format: "Ignoring knob: no level received from Home Assistant yet for %s"
+                            args: ["id(entity_ids)[id(selected_device)].c_str()"]
+                  - if:
+                      condition:
+                        lambda: return id(selected_device_has_level) && !std::isnan(id(level));
+                      then:
+                        - lambda: |-
+                            float step = id(selected_is_media_player) ? 0.02f : 0.05f;
+                            id(level) = clamp(id(level) + id(knob_steps) * step, 0.0f, 1.0f);
+                            id(level_device) = id(selected_device);
+                        - script.execute: update_level_arc
+                        - lvgl.widget.show: [level_arc, level_label]
+                        - script.execute: send_level
+
+  - id: knob_pressed
+    then:
+      - lambda: lv_display_trigger_activity(nullptr);
+      - if:
+          condition:
+            or:
+              - lvgl.is_paused:
+              - script.is_running: screen_off
+          then:
+            - script.execute: screen_on
+          else:
+            - if:
+                condition:
+                  lambda: return id(tune_mode) != 0;
+                then:
+                  - script.execute:
+                      id: change_page
+                      tune: false
+                else:
+                  - if:
+                      condition:
+                        lambda: return id(selected_device) != -1;
+                      then:
+                        - script.execute: refresh_device_page
+                        - if:
+                            condition:
+                              lambda: return !id(selected_device_available);
+                            then:
+                              - logger.log:
+                                  level: WARN
+                                  format: "Ignoring press: %s is unavailable"
+                                  args: ["id(entity_ids)[id(selected_device)].c_str()"]
+                            else:
+                              - if:
+                                  condition:
+                                    lambda: return id(selected_is_media_player);
+                                  then:
+                                    - homeassistant.action:
+                                        action: media_player.media_play_pause
+                                        data:
+                                          entity_id: !lambda return id(entity_ids)[id(selected_device)];
+                                  else:
+                                    - homeassistant.action:
+                                        action: light.toggle
+                                        data:
+                                          entity_id: !lambda return id(entity_ids)[id(selected_device)];
+
+  # Batches fast knob turns into one call; the trailing delay keeps using our own
+  # level as the base until Home Assistant has caught up with the last value sent
+  - id: send_level
+    mode: restart
+    then:
+      - delay: 150ms
+      - logger.log:
+          format: "Setting %s to %.2f"
+          args: ["id(entity_ids)[id(level_device)].c_str()", "id(level)"]
+      - if:
+          condition:
+            lambda: return str_startswith(id(entity_ids)[id(level_device)], "media_player.");
+          then:
+            - homeassistant.action:
+                action: media_player.volume_set
+                data:
+                  entity_id: !lambda return id(entity_ids)[id(level_device)];
+                  volume_level: !lambda return id(level);
+          else:
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: !lambda return id(entity_ids)[id(level_device)];
+                  brightness_pct: !lambda return (int) roundf(id(level) * 100);
+      - delay: 1s
+
+  - id: send_tune
+    mode: restart
+    then:
+      - delay: 150ms
+      - if:
+          condition:
+            lambda: return id(tune_send_mode) == 1;
+          then:
+            - logger.log:
+                format: "Setting %s to %.0f K"
+                args: ["id(entity_ids)[id(tune_device)].c_str()", "id(color_temp)"]
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: !lambda return id(entity_ids)[id(tune_device)];
+                  color_temp_kelvin: !lambda return (int) id(color_temp);
+          else:
+            - logger.log:
+                format: "Setting %s to hue %.0f, saturation %.0f"
+                args: ["id(entity_ids)[id(tune_device)].c_str()", "id(hue)", "id(saturation)"]
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: !lambda return id(entity_ids)[id(tune_device)];
+                # hs_color needs a list, which only a template can produce
+                data_template:
+                  hs_color: "{{ [hue | float, saturation | float] }}"
+                variables:
+                  hue: !lambda return id(hue);
+                  saturation: !lambda return id(saturation);
+      - delay: 1s
+
+  - id: update_second_hand
+    then:
+      - if:
+          condition:
+            lambda: return id(local_time).now().is_valid();
+          then:
+            - lvgl.indicator.update:
+                id: second_hand
+                value: !lambda |-
+                  struct timeval tv;
+                  gettimeofday(&tv, nullptr);
+                  return (tv.tv_sec % 60) * 20 + tv.tv_usec / 50000;
+
+  - id: update_clock
+    then:
+      - if:
+          condition:
+            lambda: return id(local_time).now().is_valid();
+          then:
+            - script.execute: update_second_hand
+            - lvgl.indicator.update:
+                id: minute_hand
+                value: !lambda return id(local_time).now().minute;
+            - lvgl.indicator.update:
+                id: hour_hand
+                value: !lambda |-
+                  auto now = id(local_time).now();
+                  return (now.hour % 12) * 60 + now.minute;
+
+number:
+  - platform: template
+    name: "Click volume"
+    id: click_volume
+    icon: mdi:volume-high
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Screen brightness"
+    id: screen_brightness
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 80
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            and:
+              - not:
+                  lvgl.is_paused:
+              - not:
+                  script.is_running: screen_off
+          then:
+            - lambda: id(amoled).set_brightness(x * 255 / 100);
+
+  - platform: template
+    name: "Screen timeout"
+    id: screen_timeout
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 10
+    max_value: 240
+    step: 5
+    initial_value: 120
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Back to clock timeout"
+    id: back_to_clock_timeout
+    icon: mdi:clock-start
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 5
+    max_value: 30
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+
+http_request:
+  timeout: 3s
+
+image:
+  - platform: online_image
+    id: artwork
+    url: http://localhost
+    format: AUTO
+    type: RGB565
+    resize: 390x390
+    on_download_finished:
+      - lambda: id(artwork_ready) = true;
+      - lvgl.image.update:
+          id: artwork_image
+          src: artwork
+      - if:
+          condition:
+            lambda: return id(selected_device) != -1;
+          then:
+            - script.execute: update_artwork
+    on_error:
+      - logger.log:
+          level: WARN
+          format: "Could not load the artwork"
+
+time:
+  - platform: sntp
+    id: local_time
+    timezone: Europe/Amsterdam
+    servers:
+      - ntp.home.unreal4u.com
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+
+interval:
+  - interval: 50ms
+    then:
+      - script.execute: update_second_hand
+  - interval: 1s
+    then:
+      - script.execute: update_clock
+      - if:
+          condition:
+            lambda: return id(selected_device) != -1;
+          then:
+            - script.execute: refresh_device_page
+
+spi:
+  - id: display_qspi
+    type: quad
+    clk_pin: GPIO12
+    data_pins: [GPIO11, GPIO13, GPIO7, GPIO14]
+
+display:
+  - platform: mipi_spi
+    id: amoled
+    model: CO5300
+    spi_id: display_qspi
+    cs_pin: GPIO10
+    reset_pin: GPIO4
+    enable_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    dimensions:
+      width: 390
+      height: 390
+    data_rate: 40MHz
+    auto_clear_enabled: false
+    update_interval: never
+
+i2c:
+  - id: touch_i2c
+    sda: GPIO5
+    scl: GPIO6
+
+touchscreen:
+  - platform: cst816
+    id: touch
+    i2c_id: touch_i2c
+    interrupt_pin: GPIO9
+    reset_pin: GPIO8
+    on_release:
+      - if:
+          condition:
+            or:
+              - lvgl.is_paused:
+              - script.is_running: screen_off
+          then:
+            - script.execute: screen_on
+
+lvgl:
+  displays:
+    - amoled
+  touchscreens:
+    - touch
+  on_idle:
+    timeout: !lambda return id(back_to_clock_timeout).state * 1000;
+    then:
+      - if:
+          condition:
+            lambda: return id(selected_device) != -1;
+          then:
+            - script.execute: show_clock
+  buffer_size: 25%
+  bg_color: 0x000000
+  top_layer:
+    widgets:
+      # One dot per page, created on boot
+      - obj:
+          id: page_dots
+          hidden: true
+          align: BOTTOM_MID
+          y: -30
+          width: SIZE_CONTENT
+          height: SIZE_CONTENT
+          bg_opa: TRANSP
+          border_width: 0
+          pad_all: 0
+          clickable: false
+      # One dot per vertical page of the selected light, created on boot
+      - obj:
+          id: tune_dots
+          hidden: true
+          align: RIGHT_MID
+          x: -30
+          width: SIZE_CONTENT
+          height: SIZE_CONTENT
+          bg_opa: TRANSP
+          border_width: 0
+          pad_all: 0
+          clickable: false
+  pages:
+    - id: clock_page
+      bg_color: 0x000000
+      on_swipe_left:
+        - script.execute:
+            id: swiped
+            direction: 1
+      on_swipe_right:
+        - script.execute:
+            id: swiped
+            direction: -1
+      widgets:
+        # Declared before the clock face so the hands are drawn over it
+        - label:
+            id: playing_icon
+            align: CENTER
+            y: 85
+            text_font: mdi_small
+            text_color: 0xC0C0C0
+            text: "\U000F040A"
+            hidden: true
+        - meter:
+            id: clock_face
+            align: CENTER
+            width: 390
+            height: 390
+            clickable: false
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 10
+            text_color: 0xFFFFFF
+            text_font: montserrat_28
+            scales:
+              - range_from: 0
+                range_to: 60
+                angle_range: 360
+                rotation: 270
+                ticks:
+                  count: 61
+                  width: 2
+                  length: 8
+                  color: 0x606060
+                indicators:
+                  - line:
+                      id: minute_hand
+                      width: 6
+                      color: 0xFFFFFF
+                      r_mod: -30
+              - range_from: 0
+                range_to: 12
+                angle_range: 360
+                rotation: 270
+                ticks:
+                  count: 13
+                  width: 5
+                  length: 16
+                  color: 0xC0C0C0
+              # Starts at 3 o'clock so the four labels read 3, 6, 9, 12
+              - range_from: 3
+                range_to: 12
+                angle_range: 270
+                rotation: 0
+                ticks:
+                  count: 4
+                  width: 5
+                  length: 16
+                  color: 0xC0C0C0
+                  major:
+                    stride: 1
+                    width: 5
+                    length: 16
+                    color: 0xC0C0C0
+                    label_gap: 14
+              # Own 12h*60min scale so the hour hand moves every minute
+              - range_from: 0
+                range_to: 720
+                angle_range: 360
+                rotation: 270
+                indicators:
+                  - line:
+                      id: hour_hand
+                      width: 9
+                      color: 0xFFFFFF
+                      r_mod: -80
+              # 60s * 20 steps so the second hand moves every 50ms
+              - range_from: 0
+                range_to: 1200
+                angle_range: 360
+                rotation: 270
+                indicators:
+                  - line:
+                      id: second_hand
+                      width: 2
+                      color: 0xE53935
+                      r_mod: -10
+    - id: device_page
+      bg_color: 0x000000
+      on_swipe_left:
+        - script.execute:
+            id: swiped
+            direction: 1
+      on_swipe_right:
+        - script.execute:
+            id: swiped
+            direction: -1
+      on_swipe_down:
+        - script.execute: swiped_down
+      widgets:
+        # Dimmed so the icon and text on top stay readable
+        - image:
+            id: artwork_image
+            align: CENTER
+            src: artwork
+            hidden: true
+            opa: 45%
+        # Runs clockwise from 8 to 4 o'clock, leaving the bottom free for the page dots
+        - arc:
+            id: level_arc
+            clickable: false
+            hidden: true
+            align: CENTER
+            width: 390
+            height: 390
+            rotation: 0
+            start_angle: 150
+            end_angle: 30
+            min_value: 0
+            max_value: 100
+            value: 0
+            arc_width: 14
+            arc_color: 0x303030
+            indicator:
+              arc_width: 14
+              arc_color: 0xFFFFFF
+            knob:
+              bg_opa: TRANSP
+        - label:
+            id: device_icon
+            align: CENTER
+            text_font: mdi_large
+            text_color: 0xFFFFFF
+            text: "\U000F0D38"
+        - label:
+            id: level_label
+            align: CENTER
+            y: -120
+            text_font: montserrat_28
+            text_color: 0xFFFFFF
+            text: ""
+            hidden: true
+        - label:
+            id: unavailable_icon
+            align: CENTER
+            y: -120
+            text_font: mdi_small
+            text_color: 0xE53935
+            text: "\U000F05D6"
+            hidden: true
+        - label:
+            id: more_hint
+            align: CENTER
+            y: -162
+            text_font: mdi_small
+            text_color: 0x808080
+            text: "\U000F0140"
+            hidden: true
+        - label:
+            id: device_name
+            align: CENTER
+            y: 120
+            # Fits the round screen at this height; longer names scroll
+            width: 260
+            long_mode: SCROLL_CIRCULAR
+            text_align: CENTER
+            text_font: montserrat_28
+            text_color: 0xC0C0C0
+            text: ""
+    - id: tune_page
+      bg_color: 0x000000
+      on_swipe_up:
+        - script.execute:
+            id: change_page
+            tune: false
+      on_swipe_down:
+        - script.execute: swiped_down
+      widgets:
+        - obj:
+            id: tune_gradient
+            align: CENTER
+            width: 390
+            height: 390
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            scrollable: false
+            on_short_click:
+              - lambda: |-
+                  // Swipes end in a release too; only a plain tap on the ring selects a value
+                  if (lv_indev_get_gesture_dir(lv_indev_active()) != LV_DIR_NONE) {
+                    return;
+                  }
+                  lv_point_t point;
+                  lv_indev_get_point(lv_indev_active(), &point);
+                  float dx = point.x - 195, dy = point.y - 195;
+                  float angle = fmodf(atan2f(dy, dx) * 180 / M_PI - 150 + 720, 360);
+                  if (sqrtf(dx * dx + dy * dy) < 130 || angle > 240) {
+                    return;
+                  }
+                  id(tune_to)->execute(angle / 240);
+        - label:
+            id: tune_marker
+            align: CENTER
+            width: 16
+            height: 16
+            transform_pivot_x: 8
+            transform_pivot_y: 8
+            text_align: CENTER
+            text_font: mdi_tiny
+            text_color: 0xFFFFFF
+            text: "\U000F0536"
+        - label:
+            id: tune_more_hint
+            align: CENTER
+            y: -162
+            text_font: mdi_small
+            text_color: 0x808080
+            text: "\U000F0140"
+            hidden: true
+        - label:
+            id: tune_back_hint
+            align: CENTER
+            y: 165
+            text_font: mdi_small
+            text_color: 0x808080
+            text: "\U000F0143"
+        - label:
+            id: tune_icon
+            align: CENTER
+            text_font: mdi_large
+            text_color: 0xFFFFFF
+            text: "\U000F0335"
+        - label:
+            id: tune_label
+            align: CENTER
+            y: -120
+            text_font: montserrat_28
+            text_color: 0xFFFFFF
+            text: ""
+        - label:
+            id: tune_name
+            align: CENTER
+            y: 120
+            # Fits the round screen at this height; longer names scroll
+            width: 260
+            long_mode: SCROLL_CIRCULAR
+            text_align: CENTER
+            text_font: montserrat_28
+            text_color: 0xC0C0C0
+            text: ""
+
+font:
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: mdi_large
+    size: 160
+    bpp: 4
+    # Keep in sync with icon_glyphs
+    glyphs: [
+      "\U000F093D", # mdi-audio-video
+      "\U000F02E3", # mdi-bed
+      "\U000F0118", # mdi-cast
+      "\U000F1747", # mdi-floor-lamp-torchiere
+      "\U000F06B5", # mdi-lamp
+      "\U000F07D6", # mdi-led-strip
+      "\U000F1051", # mdi-led-strip-variant
+      "\U000F0335", # mdi-lightbulb
+      "\U000F17F4", # mdi-lightbulb-spot
+      "\U000F1802", # mdi-lightbulb-variant
+      "\U000F040C", # mdi-play-circle
+      "\U000F04C3", # mdi-speaker
+      "\U000F0D38", # mdi-speaker-multiple
+      "\U000F0502", # mdi-television
+    ]
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: mdi_tiny
+    size: 16
+    bpp: 4
+    glyphs: [
+      "\U000F0536", # mdi-triangle
+    ]
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: mdi_small
+    size: 40
+    bpp: 4
+    glyphs: [
+      "\U000F05D6", # mdi-alert-circle-outline
+      "\U000F040A", # mdi-play
+      "\U000F0140", # mdi-chevron-down
+      "\U000F0143", # mdi-chevron-up
+    ]
