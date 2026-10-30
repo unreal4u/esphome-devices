@@ -775,6 +775,8 @@ script:
           ESPTime day_after_tomorrow =
             ESPTime::from_epoch_local(now_time.timestamp + 2 * 86400);
           const std::string day_after_tomorrow_date = day_after_tomorrow.strftime("%Y-%m-%d");
+          const std::string three_days_out_date =
+            ESPTime::from_epoch_local(now_time.timestamp + 3 * 86400).strftime("%Y-%m-%d");
           const std::string now_iso = now_time.strftime("%Y-%m-%dT%H:%M:%S");
 
           // A multi-day event has to appear on every day it covers, so match on
@@ -945,19 +947,30 @@ script:
             return "\U000F00ED";
           };
 
-          auto show_event = [&](int slot, int y, const CalendarEvent *event) {
+          auto show_event = [&](int slot, int y, const CalendarEvent *event,
+                                const std::string &date, const std::string &next_date) {
             bool timed = event->start.length() > 11 && event->start[10] == 'T';
+            bool timed_end = event->end.length() > 11 && event->end[10] == 'T';
+            // A timed event spanning several days shows only the part that
+            // falls on the day it is listed under.
+            bool started_earlier = event->start.substr(0, 10) < date;
+            bool continues_next_day = occurs_on(*event, next_date);
+            bool ends_at_midnight = timed_end && event->end.compare(11, 5, "00:00") == 0;
             // The icon leads the line so the calendar an event came from is
             // recognisable before reading any of the text.
             std::string when = calendar_icon(event->cal_name);
             when += " ";
-            if (timed) {
+            if (!timed || (started_earlier && (continues_next_day || ends_at_midnight))) {
+              when += "All day";
+            } else if (started_earlier) {
+              when += "Until " + event->end.substr(11, 5);
+            } else if (continues_next_day) {
+              when += "From " + event->start.substr(11, 5);
+            } else {
               when += event->start.substr(11, 5);
-              if (event->end.length() > 11 && event->end[10] == 'T') {
+              if (timed_end) {
                 when += " - " + event->end.substr(11, 5);
               }
-            } else {
-              when += "All day";
             }
             lv_label_set_text(time_labels[slot], when.c_str());
             lv_label_set_text(title_labels[slot], event->summary.c_str());
@@ -977,17 +990,18 @@ script:
 
           int slot = 0;
           for (int i = 0; i < today_shown; i++, slot++) {
-            show_event(slot, i * kRowHeight, today_events[i]);
+            show_event(slot, i * kRowHeight, today_events[i], today_date, tomorrow_date);
           }
           for (int i = 0; i < tomorrow_shown; i++, slot++) {
             show_event(slot,
                        today_block_height + kTomorrowGap + kTomorrowHeaderHeight +
                          i * kRowHeight,
-                       tomorrow_events[i]);
+                       tomorrow_events[i], tomorrow_date, day_after_tomorrow_date);
           }
           for (int i = 0; i < day_after_tomorrow_shown; i++, slot++) {
             show_event(slot, day_after_tomorrow_rows_top + i * kRowHeight,
-                       day_after_tomorrow_events[i]);
+                       day_after_tomorrow_events[i], day_after_tomorrow_date,
+                       three_days_out_date);
           }
 
           // A row cannot draw outside its own box, so the piece of rail between
